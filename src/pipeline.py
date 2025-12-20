@@ -15,6 +15,8 @@ from src.config import Config, SKUCatalog
 from src.rules.scene_generator import RuleEngine, SceneRecipe
 from src.utils.quality_control import QualityController, DistributionMonitor
 from src.utils.manifest import ManifestGenerator, calculate_hash
+from src.utils.simple_renderer import SimpleRenderer
+import yaml
 
 
 class SyntheticDataPipeline:
@@ -29,7 +31,13 @@ class SyntheticDataPipeline:
         """Initialize pipeline"""
         self.config = Config.from_yaml(config_path)
         self.catalog = SKUCatalog.from_yaml(catalog_path)
+        self.catalog_path = catalog_path
         self.blender_path = blender_path
+        
+        # Initialize renderer
+        self.renderer = SimpleRenderer(
+            resolution=tuple(self.config.rendering.resolution)
+        )
         
         # Initialize components
         self.rule_engine = RuleEngine(self.config, self.catalog)
@@ -107,18 +115,20 @@ class SyntheticDataPipeline:
         with open(recipe_path, 'w') as f:
             f.write(recipe.to_json())
         
-        # Render scene (this would call Blender in production)
-        # For now, we'll simulate the rendering
+        # Render scene using simple renderer
         print("rendering...", end=" ")
-        render_success = self._render_scene_mock(recipe, recipe_path)
+        render_success, rgb_path, instance_path, depth_path = self._render_scene(recipe, recipe_path)
         
         if not render_success:
             print("FAILED (render)")
             return False
         
-        # Generate annotations (mock)
+        # Generate annotations from instance mask
         print("annotating...", end=" ")
-        annotations = self._generate_annotations_mock(recipe)
+        annotations = self._generate_annotations_from_mask(recipe, instance_path, depth_path)
+        
+        # Export annotations to Pascal VOC format
+        self._export_annotations(recipe, annotations, rgb_path)
         
         # Run QC
         print("QC...", end=" ")
@@ -157,67 +167,101 @@ class SyntheticDataPipeline:
                 return False  # Will retry with different scene
             return True  # Count as processed even if failed
     
-    def _render_scene_mock(self, recipe: SceneRecipe, recipe_path: Path) -> bool:
-        """Mock rendering - in production this calls Blender"""
-        # In production, this would be:
-        # subprocess.run([
-        #     self.blender_path,
-        #     "--background",
-        #     "--python", "src/blender_scripts/blender_renderer.py",
-        #     "--",
-        #     "--recipe", str(recipe_path),
-        #     "--output", str(self.config.get_output_paths()['base'])
-        # ])
-        
-        # For now, just simulate success
-        return True
+    def _render_scene(self, recipe: SceneRecipe, recipe_path: Path) -> tuple:
+        """Render scene using simple 2D renderer"""
+        try:
+            # Load catalog for rendering
+            with open(self.catalog_path, 'r') as f:
+                catalog_dict = yaml.safe_load(f)
+            
+            paths = self.config.get_output_paths()
+            rgb_path, instance_path, depth_path = self.renderer.render_scene(
+                recipe,
+                paths['images'],
+                catalog_dict
+            )
+            return True, rgb_path, instance_path, depth_path
+        except Exception as e:
+            print(f"Render error: {e}")
+            return False, None, None, None
     
-    def _generate_annotations_mock(self, recipe: SceneRecipe) -> list:
-        """Mock annotation generation"""
-        # In production, this would use the actual AnnotationGenerator
-        # with real instance masks and depth maps
+    def _generate_annotations_from_mask(
+        self, 
+        recipe: SceneRecipe, 
+        instance_path: str,
+        depth_path: str
+    ) -> list:
+        """Generate annotations from instance mask and depth map"""
+        import cv2
+        from src.annotations.annotation_generator import AnnotationGenerator
         
-        from src.annotations.annotation_generator import Annotation, BoundingBox
-        import random
+        # Load images
+        instance_mask = cv2.imread(instance_path, cv2.IMREAD_UNCHANGED)
+        depth_map = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
         
-        annotations = []
-        rng = random.Random(recipe.seed)
-        
-        res_w, res_h = self.config.rendering.resolution
+        # Create SKU mapping (instance_id -> sku_id)
+        sku_mapping = {}
+        category_mapping = {}
+        instance_id = 1
         
         for shelf in recipe.shelves:
             for slot in shelf.slots:
                 for product in slot.products:
-                    # Create mock annotation with bounds checking
-                    w = rng.randint(50, 150)
-                    h = rng.randint(80, 200)
-                    x = rng.randint(100, max(101, res_w - w - 100))
-                    y = rng.randint(100, max(101, res_h - h - 100))
+                    sku_mapping[instance_id] = product.sku_id
                     
-                    # Ensure bbox is within image bounds
-                    xmax = min(x + w, res_w - 1)
-                    ymax = min(y + h, res_h - 1)
-                    
-                    bbox = BoundingBox(x, y, xmax, ymax)
-                    
+                    # Get category
                     try:
                         sku = self.catalog.get_sku_by_id(product.sku_id)
-                        category = sku.category
+                        category_mapping[product.sku_id] = sku.category
                     except ValueError:
-                        category = "unknown"
+                        category_mapping[product.sku_id] = "unknown"
                     
-                    annotation = Annotation(
-                        sku_id=product.sku_id,
-                        category=category,
-                        bbox=bbox,
-                        polygon=[(x, y), (xmax, y), (xmax, ymax), (x, ymax)],
-                        occlusion_ratio=rng.uniform(0.0, 0.5),
-                        truncated=False,
-                        difficult=False
-                    )
-                    annotations.append(annotation)
+                    instance_id += 1
+        
+        # Generate annotations
+        ann_gen = AnnotationGenerator(
+            min_bbox_area=self.config.annotation.min_bbox_area,
+            polygon_tolerance=self.config.annotation.polygon_simplification_tolerance,
+            occlusion_threshold=self.config.placement.occlusion_threshold
+        )
+        
+        annotations = ann_gen.generate_annotations(
+            instance_mask,
+            depth_map,
+            sku_mapping,
+            category_mapping
+        )
         
         return annotations
+    
+    def _export_annotations(
+        self, 
+        recipe: SceneRecipe, 
+        annotations: list,
+        rgb_path: str
+    ):
+        """Export annotations to Pascal VOC XML format"""
+        from src.annotations.annotation_generator import AnnotationGenerator
+        import cv2
+        
+        # Load image to get dimensions
+        image = cv2.imread(rgb_path)
+        if image is None:
+            return
+        
+        height, width, channels = image.shape
+        
+        # Export to Pascal VOC
+        ann_gen = AnnotationGenerator()
+        paths = self.config.get_output_paths()
+        annotation_path = paths['annotations'] / f"{recipe.scene_id}.xml"
+        
+        ann_gen.export_pascal_voc(
+            annotations,
+            rgb_path,
+            (width, height, channels),
+            str(annotation_path)
+        )
     
     def _save_dataset_manifest(self):
         """Save dataset manifest"""

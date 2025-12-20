@@ -158,33 +158,28 @@ class AnnotationGenerator:
         instance_id: int
     ) -> float:
         """Calculate occlusion ratio using depth information"""
-        # Get depth values for this instance
-        instance_depths = depth_map[binary_mask > 0]
+        # For 2D rendering, we use a simplified approach
+        # Real occlusion would require checking for overlapping instances
         
-        if len(instance_depths) == 0:
-            return 0.0
-        
-        # Get median depth of this instance
-        median_depth = np.median(instance_depths)
-        
-        # Count pixels that are occluded (other instances in front)
-        # An instance in front would have smaller depth values
+        # Get bounding box
         bbox = self._calculate_bbox(binary_mask)
         if bbox is None:
             return 0.0
         
-        # Get region of interest
+        # Count pixels of this instance within its bbox
         roi_mask = instance_mask[bbox.ymin:bbox.ymax, bbox.xmin:bbox.xmax]
-        roi_depth = depth_map[bbox.ymin:bbox.ymax, bbox.xmin:bbox.xmax]
+        visible_pixels = np.sum(roi_mask == instance_id)
         
-        # Expected area based on bbox
-        expected_area = bbox.area
+        # Count pixels of OTHER instances within this bbox (occlusion)
+        other_instance_pixels = np.sum((roi_mask > 0) & (roi_mask != instance_id))
         
-        # Actual visible area
-        visible_area = np.sum(binary_mask[bbox.ymin:bbox.ymax, bbox.xmin:bbox.xmax])
+        total_pixels = visible_pixels + other_instance_pixels
         
-        # Occlusion ratio
-        occlusion_ratio = 1.0 - (visible_area / max(expected_area, 1))
+        if total_pixels == 0:
+            return 0.0
+        
+        # Occlusion ratio: other instances / total foreground
+        occlusion_ratio = other_instance_pixels / total_pixels
         
         return float(np.clip(occlusion_ratio, 0.0, 1.0))
     
