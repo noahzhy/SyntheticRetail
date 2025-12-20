@@ -7,7 +7,7 @@ skus:
     name: "Cola Bottle 500ml"
     category: "beverages"
     subcategory: "soft_drinks"
-    blend_file: "assets/beverages/cola_500ml.blend"
+    blend_file: "assets/beverages/can.blend"
     object_name: "Cola_Bottle"
     dimensions: [0.065, 0.065, 0.22]  # width, depth, height in meters
     weight: 1.0  # relative sampling weight
