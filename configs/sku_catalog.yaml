@@ -1,0 +1,73 @@
+# SKU Catalog - Product definitions
+# Each SKU entry defines a retail product with its properties
+
+skus:
+  # Beverages
+  - id: "SKU001"
+    name: "Cola Bottle 500ml"
+    category: "beverages"
+    subcategory: "soft_drinks"
+    blend_file: "assets/beverages/can.blend"
+    object_name: "Cola_Bottle"
+    dimensions: [0.065, 0.065, 0.22]  # width, depth, height in meters
+    weight: 1.0  # relative sampling weight
+    
+  - id: "SKU002"
+    name: "Water Bottle 1L"
+    category: "beverages"
+    subcategory: "water"
+    blend_file: "assets/beverages/water_1l.blend"
+    object_name: "Water_Bottle"
+    dimensions: [0.075, 0.075, 0.28]
+    weight: 1.0
+    
+  # Snacks
+  - id: "SKU003"
+    name: "Chips Bag Large"
+    category: "snacks"
+    subcategory: "chips"
+    blend_file: "assets/snacks/chips_large.blend"
+    object_name: "Chips_Bag"
+    dimensions: [0.15, 0.08, 0.25]
+    weight: 1.0
+    
+  - id: "SKU004"
+    name: "Chocolate Bar"
+    category: "snacks"
+    subcategory: "candy"
+    blend_file: "assets/snacks/chocolate_bar.blend"
+    object_name: "Chocolate"
+    dimensions: [0.12, 0.03, 0.18]
+    weight: 1.0
+    
+  # Dairy
+  - id: "SKU005"
+    name: "Milk Carton 1L"
+    category: "dairy"
+    subcategory: "milk"
+    blend_file: "assets/dairy/milk_1l.blend"
+    object_name: "Milk_Carton"
+    dimensions: [0.08, 0.08, 0.24]
+    weight: 1.0
+    
+  - id: "SKU006"
+    name: "Yogurt Cup"
+    category: "dairy"
+    subcategory: "yogurt"
+    blend_file: "assets/dairy/yogurt_cup.blend"
+    object_name: "Yogurt"
+    dimensions: [0.07, 0.07, 0.09]
+    weight: 1.0
+
+# Category grouping rules for realistic shelf layout
+category_affinity:
+  beverages: ["beverages"]
+  snacks: ["snacks"]
+  dairy: ["dairy"]
+  
+# Placement constraints
+constraints:
+  # Heavy items should be on lower shelves
+  heavy_items: ["SKU002", "SKU005"]
+  # Small items can be grouped together
+  small_items: ["SKU004", "SKU006"]

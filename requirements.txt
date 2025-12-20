@@ -1,0 +1,8 @@
+# Core dependencies
+PyYAML>=6.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+matplotlib>=3.5.0
+
+# Optional dependencies for full functionality
+# Blender comes with its own Python, so these are for the orchestration layer only

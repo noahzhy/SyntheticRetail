@@ -1,0 +1,76 @@
+# Default configuration for Synthetic Retail Data Factory
+
+# Dataset output settings
+dataset:
+  output_dir: "./dataset"
+  images_dir: "images"
+  annotations_dir: "annotations"
+  manifests_dir: "manifests"
+  
+# Scene generation settings
+scene:
+  seed_base: 42
+  num_scenes: 1000
+  shelves_per_scene: [3, 5]  # min, max
+  slots_per_shelf: [8, 12]    # min, max
+  
+# Shelf and slot physical parameters
+shelf:
+  width: 1.2  # meters
+  height: 0.4  # meters
+  depth: 0.3  # meters
+  vertical_spacing: 0.5  # meters between shelves
+  
+slot:
+  width: 0.1  # meters
+  height: 0.35  # meters
+  depth: 0.25  # meters
+  
+# Product placement rules
+placement:
+  max_products_per_slot: 3
+  min_products_per_slot: 0
+  occlusion_threshold: 0.3  # minimum visible ratio to be valid
+  allow_empty_slots: true
+  category_grouping: true  # group similar categories together
+  
+# Rendering settings
+rendering:
+  resolution: [1920, 1080]
+  samples: 128
+  use_denoising: true
+  channels:
+    - rgb
+    - instance_id
+    - depth
+    
+# Camera settings
+camera:
+  height: [1.2, 1.8]  # min, max height from ground
+  distance: [1.5, 3.0]  # min, max distance from shelf
+  angle_horizontal: [-30, 30]  # degrees
+  angle_vertical: [-15, 15]  # degrees
+  fov: 50  # field of view in degrees
+  
+# Annotation settings
+annotation:
+  format: "pascal_voc"  # Pascal VOC XML format
+  include_occluded: true
+  min_bbox_area: 100  # minimum bbox area in pixels
+  polygon_simplification_tolerance: 2.0  # pixels
+  
+# Quality control settings
+qc:
+  min_products_per_image: 5
+  max_occlusion_rate: 0.8
+  check_bbox_validity: true
+  check_empty_images: true
+  resample_on_failure: true
+  max_resample_attempts: 3
+  
+# Distribution monitoring
+distribution:
+  track_sku_balance: true
+  track_category_balance: true
+  track_occlusion_distribution: true
+  report_frequency: 100  # generate report every N images
