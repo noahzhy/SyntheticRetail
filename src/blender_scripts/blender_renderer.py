@@ -345,9 +345,11 @@ class BlenderRenderer:
         """Render all required channels"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        scene_id = self.scene_id
+        
         # Render RGB
         print("Rendering RGB...")
-        rgb_path = self.output_dir / f"{self.scene_id}_rgb.png"
+        rgb_path = self.output_dir / f"{scene_id}_rgb.png"
         bpy.context.scene.render.filepath = str(rgb_path)
         bpy.ops.render.render(write_still=True)
         print(f"RGB saved to {rgb_path}")

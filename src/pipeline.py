@@ -202,19 +202,60 @@ class SyntheticDataPipeline:
                     print(f"Blender render failed: {message}")
                     return False, None, None, None
                 
-                # Construct paths to rendered files
+                # Blender OutputFile node adds frame numbers (0001) to filenames
+                # Check for both with and without frame numbers
                 rgb_path = paths['images'] / f"{recipe.scene_id}_rgb.png"
-                instance_path = paths['images'] / f"{recipe.scene_id}_instance0001.png"  # Blender adds 0001
-                depth_path = paths['images'] / f"{recipe.scene_id}_depth0001.png"
                 
-                # Rename files to remove Blender's 0001 suffix
-                if instance_path.exists():
-                    instance_path.rename(paths['images'] / f"{recipe.scene_id}_instance.png")
-                    instance_path = paths['images'] / f"{recipe.scene_id}_instance.png"
+                # Try different possible filenames that Blender might create
+                instance_candidates = [
+                    paths['images'] / f"{recipe.scene_id}_instance.png",
+                    paths['images'] / f"{recipe.scene_id}_instance0001.png",
+                    paths['images'] / f"{recipe.scene_id}_instance0000.png",
+                ]
                 
-                if depth_path.exists():
-                    depth_path.rename(paths['images'] / f"{recipe.scene_id}_depth.png")
-                    depth_path = paths['images'] / f"{recipe.scene_id}_depth.png"
+                depth_candidates = [
+                    paths['images'] / f"{recipe.scene_id}_depth.png",
+                    paths['images'] / f"{recipe.scene_id}_depth0001.png",
+                    paths['images'] / f"{recipe.scene_id}_depth0000.png",
+                ]
+                
+                # Find actual instance file
+                instance_path = None
+                for candidate in instance_candidates:
+                    if candidate.exists():
+                        instance_path = candidate
+                        break
+                
+                # Find actual depth file
+                depth_path = None
+                for candidate in depth_candidates:
+                    if candidate.exists():
+                        depth_path = candidate
+                        break
+                
+                # Verify all files exist
+                if not rgb_path.exists():
+                    print(f"RGB file not found: {rgb_path}")
+                    return False, None, None, None
+                
+                if instance_path is None:
+                    print(f"Instance mask not found. Tried: {[str(c) for c in instance_candidates]}")
+                    return False, None, None, None
+                
+                if depth_path is None:
+                    print(f"Depth map not found. Tried: {[str(c) for c in depth_candidates]}")
+                    return False, None, None, None
+                
+                # Rename files to standard names (without frame numbers)
+                if instance_path.name != f"{recipe.scene_id}_instance.png":
+                    target = paths['images'] / f"{recipe.scene_id}_instance.png"
+                    instance_path.rename(target)
+                    instance_path = target
+                
+                if depth_path.name != f"{recipe.scene_id}_depth.png":
+                    target = paths['images'] / f"{recipe.scene_id}_depth.png"
+                    depth_path.rename(target)
+                    depth_path = target
                 
                 return True, str(rgb_path), str(instance_path), str(depth_path)
             
@@ -249,6 +290,13 @@ class SyntheticDataPipeline:
         # Load images
         instance_mask = cv2.imread(instance_path, cv2.IMREAD_UNCHANGED)
         depth_map = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+        
+        # Validate images loaded successfully
+        if instance_mask is None:
+            raise ValueError(f"Failed to load instance mask from: {instance_path}")
+        
+        if depth_map is None:
+            raise ValueError(f"Failed to load depth map from: {depth_path}")
         
         # Create SKU mapping (instance_id -> sku_id)
         sku_mapping = {}
