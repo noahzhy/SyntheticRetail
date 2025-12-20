@@ -15,7 +15,7 @@ from src.config import Config, SKUCatalog
 from src.rules.scene_generator import RuleEngine, SceneRecipe
 from src.utils.quality_control import QualityController, DistributionMonitor
 from src.utils.manifest import ManifestGenerator, calculate_hash
-from src.utils.simple_renderer import SimpleRenderer
+from src.utils.renderer_3d import Renderer3D
 import yaml
 
 
@@ -34,8 +34,8 @@ class SyntheticDataPipeline:
         self.catalog_path = catalog_path
         self.blender_path = blender_path
         
-        # Initialize renderer
-        self.renderer = SimpleRenderer(
+        # Initialize 3D renderer
+        self.renderer = Renderer3D(
             resolution=tuple(self.config.rendering.resolution)
         )
         
