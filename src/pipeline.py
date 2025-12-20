@@ -16,6 +16,7 @@ from src.rules.scene_generator import RuleEngine, SceneRecipe
 from src.utils.quality_control import QualityController, DistributionMonitor
 from src.utils.manifest import ManifestGenerator, calculate_hash
 from src.utils.renderer_3d import Renderer3D
+from src.utils.blender_integration import BlenderIntegration
 import yaml
 
 
@@ -26,18 +27,35 @@ class SyntheticDataPipeline:
         self,
         config_path: str = "configs/default_config.yaml",
         catalog_path: str = "configs/sku_catalog.yaml",
-        blender_path: str = "blender"
+        blender_path: str = "blender",
+        use_blender: bool = True
     ):
         """Initialize pipeline"""
         self.config = Config.from_yaml(config_path)
         self.catalog = SKUCatalog.from_yaml(catalog_path)
         self.catalog_path = catalog_path
         self.blender_path = blender_path
+        self.use_blender = use_blender
         
-        # Initialize 3D renderer
-        self.renderer = Renderer3D(
-            resolution=tuple(self.config.rendering.resolution)
-        )
+        # Initialize Blender integration
+        self.blender = BlenderIntegration(blender_path)
+        
+        # Determine which renderer to use
+        if use_blender and self.blender.available:
+            print("Using Blender for photorealistic rendering")
+            self.renderer_mode = "blender"
+            self.renderer = None  # Blender renders via subprocess
+        else:
+            if use_blender and not self.blender.available:
+                print("Blender not found, falling back to matplotlib 3D renderer")
+                print(self.blender.install_instructions())
+            else:
+                print("Using matplotlib 3D renderer")
+            
+            self.renderer_mode = "matplotlib"
+            self.renderer = Renderer3D(
+                resolution=tuple(self.config.rendering.resolution)
+            )
         
         # Initialize components
         self.rule_engine = RuleEngine(self.config, self.catalog)
@@ -168,21 +186,54 @@ class SyntheticDataPipeline:
             return True  # Count as processed even if failed
     
     def _render_scene(self, recipe: SceneRecipe, recipe_path: Path) -> tuple:
-        """Render scene using simple 2D renderer"""
+        """Render scene using Blender or matplotlib 3D renderer"""
         try:
-            # Load catalog for rendering
-            with open(self.catalog_path, 'r') as f:
-                catalog_dict = yaml.safe_load(f)
-            
             paths = self.config.get_output_paths()
-            rgb_path, instance_path, depth_path = self.renderer.render_scene(
-                recipe,
-                paths['images'],
-                catalog_dict
-            )
-            return True, rgb_path, instance_path, depth_path
+            
+            if self.renderer_mode == "blender":
+                # Use Blender for photorealistic rendering
+                success, message = self.blender.render_scene(
+                    str(recipe_path),
+                    str(paths['images']),
+                    str(Path(__file__).parent / 'blender_scripts' / 'blender_renderer.py')
+                )
+                
+                if not success:
+                    print(f"Blender render failed: {message}")
+                    return False, None, None, None
+                
+                # Construct paths to rendered files
+                rgb_path = paths['images'] / f"{recipe.scene_id}_rgb.png"
+                instance_path = paths['images'] / f"{recipe.scene_id}_instance0001.png"  # Blender adds 0001
+                depth_path = paths['images'] / f"{recipe.scene_id}_depth0001.png"
+                
+                # Rename files to remove Blender's 0001 suffix
+                if instance_path.exists():
+                    instance_path.rename(paths['images'] / f"{recipe.scene_id}_instance.png")
+                    instance_path = paths['images'] / f"{recipe.scene_id}_instance.png"
+                
+                if depth_path.exists():
+                    depth_path.rename(paths['images'] / f"{recipe.scene_id}_depth.png")
+                    depth_path = paths['images'] / f"{recipe.scene_id}_depth.png"
+                
+                return True, str(rgb_path), str(instance_path), str(depth_path)
+            
+            else:
+                # Use matplotlib 3D renderer (fallback)
+                with open(self.catalog_path, 'r') as f:
+                    catalog_dict = yaml.safe_load(f)
+                
+                rgb_path, instance_path, depth_path = self.renderer.render_scene(
+                    recipe,
+                    paths['images'],
+                    catalog_dict
+                )
+                return True, rgb_path, instance_path, depth_path
+                
         except Exception as e:
             print(f"Render error: {e}")
+            import traceback
+            traceback.print_exc()
             return False, None, None, None
     
     def _generate_annotations_from_mask(
@@ -308,6 +359,18 @@ def main():
         default="blender",
         help="Path to Blender executable"
     )
+    parser.add_argument(
+        "--use-blender",
+        action="store_true",
+        default=True,
+        help="Use Blender for rendering (default: True). Use --no-blender to disable."
+    )
+    parser.add_argument(
+        "--no-blender",
+        dest="use_blender",
+        action="store_false",
+        help="Disable Blender and use matplotlib 3D renderer instead"
+    )
     
     args = parser.parse_args()
     
@@ -315,7 +378,8 @@ def main():
     pipeline = SyntheticDataPipeline(
         config_path=args.config,
         catalog_path=args.catalog,
-        blender_path=args.blender_path
+        blender_path=args.blender_path,
+        use_blender=args.use_blender
     )
     
     pipeline.generate_dataset(num_scenes=args.num_scenes)
