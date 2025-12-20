@@ -535,65 +535,6 @@ if __name__ == "__main__":
             light = bpy.context.active_object
             light.data.energy = 100
             light.data.size = 2
-    
-    def render(self):
-        """Render all required channels"""
-        scene_id = self.recipe['scene_id']
-        
-        # Create output directory
-        output_path = self.output_dir / scene_id
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Render RGB
-        rgb_path = output_path / f"{scene_id}_rgb.png"
-        bpy.context.scene.render.filepath = str(rgb_path)
-        bpy.ops.render.render(write_still=True)
-        
-        # Render instance ID (using IndexOB pass)
-        self._render_instance_id(output_path, scene_id)
-        
-        # Render depth
-        self._render_depth(output_path, scene_id)
-        
-        return str(output_path)
-    
-    def _render_instance_id(self, output_path: Path, scene_id: str):
-        """Render instance ID pass"""
-        scene = bpy.context.scene
-        scene.view_layers["ViewLayer"].use_pass_object_index = True
-        
-        # Setup compositor nodes to output instance ID
-        tree = scene.node_tree
-        tree.nodes.clear()
-        
-        render_layers = tree.nodes.new('CompositorNodeRLayers')
-        output = tree.nodes.new('CompositorNodeOutputFile')
-        output.base_path = str(output_path)
-        output.file_slots[0].path = f"{scene_id}_instance"
-        
-        tree.links.new(render_layers.outputs['IndexOB'], output.inputs[0])
-        
-        bpy.ops.render.render(write_still=True)
-    
-    def _render_depth(self, output_path: Path, scene_id: str):
-        """Render depth pass"""
-        scene = bpy.context.scene
-        scene.view_layers["ViewLayer"].use_pass_z = True
-        
-        # Setup compositor for depth
-        tree = scene.node_tree
-        tree.nodes.clear()
-        
-        render_layers = tree.nodes.new('CompositorNodeRLayers')
-        normalize = tree.nodes.new('CompositorNodeNormalize')
-        output = tree.nodes.new('CompositorNodeOutputFile')
-        output.base_path = str(output_path)
-        output.file_slots[0].path = f"{scene_id}_depth"
-        
-        tree.links.new(render_layers.outputs['Depth'], normalize.inputs[0])
-        tree.links.new(normalize.outputs[0], output.inputs[0])
-        
-        bpy.ops.render.render(write_still=True)
 
 
 def main():
