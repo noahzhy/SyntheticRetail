@@ -1,4 +1,13 @@
 *.blend1
+labels/*
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.gif
+*.exr
+*.hdr
 
 # Python
 __pycache__/

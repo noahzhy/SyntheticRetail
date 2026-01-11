@@ -1,9 +1,12 @@
 import bpy
 import bmesh
+import os
+import json
 import random
 import math
 import mathutils
 from mathutils import Vector, Quaternion
+from bpy_extras.object_utils import world_to_camera_view
 
 # ------------------------------------------------------------------------
 # Core Operator
@@ -132,6 +135,7 @@ class MESH_OT_GenerateBoxesOnFace(bpy.types.Operator):
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='EDIT')
         return {'FINISHED'}
+
     def generate_random_points(self, face, count, min_dist, obj_size, proj_data, allow_overhang=False):
         tris = triangulate_face(face)
         if not tris: return []
@@ -186,6 +190,340 @@ class MESH_OT_GenerateBoxesOnFace(bpy.types.Operator):
                     curr_u -= spacing
                 curr_v -= spacing
             return points
+
+
+class SCENE_OT_ExportSynthBBoxes(bpy.types.Operator):
+    """Export 2D bounding boxes for all objects in the 'synth' collection.
+    Bounding boxes are computed from frustum-clipped geometry.
+    Occlusion is reported as a property, not used as a filter.
+    """
+    bl_idname = "scene.export_synth_bboxes"
+    bl_label = "Export Synth BBoxes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    output_dir: bpy.props.StringProperty(
+        name="Output Dir",
+        description="Directory to save outputs (JSON + render JPG). Defaults to the blend folder.",
+        default="//",
+        subtype='DIR_PATH'
+    )
+
+    base_name: bpy.props.StringProperty(
+        name="Base Name",
+        description="Base filename (without extension) for outputs",
+        default="synth",
+    )
+
+    output_path: bpy.props.StringProperty(
+        name="Output JSON",
+        description="Path to save bounding boxes JSON (defaults to blend folder)",
+        default="//synth_bboxes.json",
+        subtype='FILE_PATH'
+    )
+
+    export_render_jpg: bpy.props.BoolProperty(
+        name="Export Render (JPG)",
+        description="Also render the current scene and save as JPG into Output Dir",
+        default=True,
+    )
+
+    min_visible_ratio: bpy.props.FloatProperty(
+        name="Min Visible Ratio",
+        description="Minimum visible proxy ratio based on clipped geometry",
+        default=0.05,
+        min=0.0,
+        max=1.0,
+    )
+
+    min_bbox_area: bpy.props.FloatProperty(
+        name="Min BBox Area",
+        description="Discard extremely small boxes (normalized area)",
+        default=1e-4,
+        min=0.0,
+        max=1.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.camera is not None
+
+    # ------------------------------------------------------------------
+    # Entry
+    # ------------------------------------------------------------------
+
+    def execute(self, context):
+        scene = context.scene
+        cam = scene.camera
+        depsgraph = context.evaluated_depsgraph_get()
+
+        # Allow UI panel (Scene.export_props) to drive defaults.
+        export_props = getattr(scene, "export_props", None)
+        if export_props is not None:
+            if self.output_dir in {"", "//"} and getattr(export_props, "output_dir", ""):
+                self.output_dir = export_props.output_dir
+            if self.base_name == "synth" and getattr(export_props, "base_name", ""):
+                self.base_name = export_props.base_name
+            if getattr(export_props, "export_render_jpg", None) is not None:
+                self.export_render_jpg = export_props.export_render_jpg
+            if getattr(export_props, "min_visible_ratio", None) is not None:
+                self.min_visible_ratio = export_props.min_visible_ratio
+
+        col = bpy.data.collections.get("synth")
+        if not col:
+            self.report({'WARNING'}, "Collection 'synth' not found")
+            return {'CANCELLED'}
+
+        results = []
+
+        for obj in col.all_objects:
+            if not self._is_mesh_renderable(obj):
+                continue
+
+            bbox = self._compute_visible_bbox(scene, cam, depsgraph, obj)
+            if not bbox:
+                continue
+
+            xmin, ymin, xmax, ymax, visible_proxy, total_proxy, occluded = bbox
+
+            # 只用 bbox 几何过滤
+            area = (xmax - xmin) * (ymax - ymin)
+            if area < self.min_bbox_area:
+                continue
+
+            results.append({
+                "label": obj.name,
+                "bbox": [xmin, ymin, xmax, ymax],
+                "occluded": occluded,
+                "visible_proxy": visible_proxy,
+                "total_proxy": total_proxy,
+                "visible_ratio": (
+                    float(visible_proxy) / float(total_proxy)
+                    if total_proxy > 0 else 0.0
+                ),
+            })
+
+        if not results:
+            self.report({'WARNING'}, "No valid visible objects in 'synth'")
+            return {'CANCELLED'}
+
+        out_dir = bpy.path.abspath(self.output_dir)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to create output dir: {exc}")
+            return {'CANCELLED'}
+
+        # Keep backward compatibility: if output_path is explicitly set to a non-default,
+        # honor it; otherwise write to Output Dir with Base Name.
+        default_out_path = bpy.path.abspath("//synth_bboxes.json")
+        chosen_out_path = bpy.path.abspath(self.output_path)
+        if chosen_out_path == default_out_path:
+            out_path = os.path.join(out_dir, f"{self.base_name}.json")
+        else:
+            out_path = chosen_out_path
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to write JSON: {exc}")
+            return {'CANCELLED'}
+
+        # Render JPG to Output Dir
+        jpg_path = os.path.join(out_dir, f"{self.base_name}.jpg")
+        if self.export_render_jpg:
+            prev_filepath = scene.render.filepath
+            prev_format = scene.render.image_settings.file_format
+            try:
+                scene.render.filepath = jpg_path
+                scene.render.image_settings.file_format = 'JPEG'
+                bpy.ops.render.render(write_still=True)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Failed to render JPG: {exc}")
+                return {'CANCELLED'}
+            finally:
+                scene.render.filepath = prev_filepath
+                scene.render.image_settings.file_format = prev_format
+
+        if self.export_render_jpg:
+            self.report({'INFO'}, f"Saved {len(results)} boxes to {out_path} and render to {jpg_path}")
+        else:
+            self.report({'INFO'}, f"Saved {len(results)} boxes to {out_path}")
+        return {'FINISHED'}
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    def _is_mesh_renderable(self, obj):
+        return (
+            obj.type == 'MESH'
+            and obj.visible_get()
+            and not obj.hide_render
+        )
+
+    # ------------------------------------------------------------------
+    # Core bbox logic
+    # ------------------------------------------------------------------
+
+    def _compute_visible_bbox(self, scene, cam, depsgraph, obj):
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        if not mesh:
+            return None
+
+        world_matrix = eval_obj.matrix_world
+        cam_loc = cam.matrix_world.translation
+
+        # --------------------------------------------------
+        # Camera matrices
+        # --------------------------------------------------
+        render = scene.render
+        res_x = max(1, int(round(render.resolution_x * render.resolution_percentage / 100)))
+        res_y = max(1, int(round(render.resolution_y * render.resolution_percentage / 100)))
+
+        proj_mat = cam.calc_matrix_camera(
+            depsgraph,
+            x=res_x,
+            y=res_y,
+            scale_x=render.pixel_aspect_x,
+            scale_y=render.pixel_aspect_y,
+        )
+        view_mat = cam.matrix_world.inverted()
+        clip_mat = proj_mat @ view_mat
+        inv_clip_mat = clip_mat.inverted()
+
+        # --------------------------------------------------
+        # Frustum planes (clip space)
+        # --------------------------------------------------
+        planes = (
+            Vector(( 1,  0,  0, 1)),
+            Vector((-1,  0,  0, 1)),
+            Vector(( 0,  1,  0, 1)),
+            Vector(( 0, -1,  0, 1)),
+            Vector(( 0,  0,  1, 1)),
+            Vector(( 0,  0, -1, 1)),
+        )
+
+        def clip_poly(poly, plane):
+            out = []
+            prev = poly[-1]
+            prev_d = plane.dot(prev)
+            prev_in = prev_d >= 0
+            for cur in poly:
+                cur_d = plane.dot(cur)
+                cur_in = cur_d >= 0
+                if cur_in != prev_in:
+                    t = prev_d / (prev_d - cur_d)
+                    out.append(prev.lerp(cur, t))
+                if cur_in:
+                    out.append(cur)
+                prev, prev_d, prev_in = cur, cur_d, cur_in
+            return out
+
+        def clip_frustum(poly):
+            for pl in planes:
+                poly = clip_poly(poly, pl)
+                if not poly:
+                    break
+            return poly
+
+        def is_point_visible(clip_pos):
+            # Unproject clip space to world space
+            world_homo = inv_clip_mat @ clip_pos
+            if abs(world_homo.w) < 1e-6:
+                return False
+            world_pos = Vector((world_homo.x, world_homo.y, world_homo.z)) / world_homo.w
+            
+            ray_dir = world_pos - cam_loc
+            ray_len = ray_dir.length
+            if ray_len < 1e-4:
+                return True
+
+            hit, _, _, _, hit_obj, _ = scene.ray_cast(
+                depsgraph,
+                cam_loc,
+                ray_dir.normalized(),
+                distance=ray_len - 1e-4,
+            )
+            
+            # If hit something that is NOT the object itself, it's occluded
+            occluded = (
+                hit and hit_obj and
+                getattr(hit_obj, "original", hit_obj) != obj
+            )
+            return not occluded
+
+        # --------------------------------------------------
+        # Collect bbox + occlusion proxy
+        # --------------------------------------------------
+        frustum_pts = []
+        visible_polys = 0
+        occluded_polys = 0
+
+        for poly in mesh.polygons:
+            poly4 = []
+            for vi in poly.vertices:
+                wco = world_matrix @ mesh.vertices[vi].co
+                poly4.append(clip_mat @ Vector((wco.x, wco.y, wco.z, 1.0)))
+
+            clipped = clip_frustum(poly4)
+            if not clipped:
+                continue
+
+            # ---------- face-center ray occlusion ----------
+            center = Vector()
+            count = 0
+            for p4 in clipped:
+                if abs(p4.w) < 1e-6:
+                    continue
+                ndc = Vector((p4.x / p4.w, p4.y / p4.w, p4.z / p4.w))
+                center += ndc
+                count += 1
+
+            if count == 0:
+                continue
+
+            center /= count
+            
+            # Check center visibility
+            center_clip = Vector((center.x, center.y, center.z, 1.0))
+            if not is_point_visible(center_clip):
+                occluded_polys += 1
+            else:
+                visible_polys += 1
+                # Only collect bbox points from visible vertices of visible polygons
+                for p4 in clipped:
+                    if abs(p4.w) < 1e-6:
+                        continue
+                    
+                    # Strict check: verify each vertex is visible
+                    if is_point_visible(p4):
+                        u = (p4.x / p4.w + 1.0) * 0.5
+                        v = (p4.y / p4.w + 1.0) * 0.5
+                        frustum_pts.append((u, v))
+
+        total_polys = visible_polys + occluded_polys
+        eval_obj.to_mesh_clear()
+
+        if not frustum_pts or total_polys == 0:
+            return None
+
+        xs = [p[0] for p in frustum_pts]
+        ys = [p[1] for p in frustum_pts]
+
+        xmin = max(0.0, min(xs))
+        xmax = min(1.0, max(xs))
+        ymin_b = max(0.0, min(ys))
+        ymax_b = min(1.0, max(ys))
+
+        ymin = 1.0 - ymax_b
+        ymax = 1.0 - ymin_b
+
+        visible_ratio = visible_polys / total_polys
+        occluded = visible_ratio < self.min_visible_ratio
+
+        return xmin, ymin, xmax, ymax, visible_polys, total_polys, occluded
 
 
 class MESH_OT_SubdivideFaceLongEdge(bpy.types.Operator):
@@ -377,6 +715,34 @@ class GenProperties(bpy.types.PropertyGroup):
     box_size: bpy.props.FloatProperty(name="Size", default=0.2, min=0.01)
     min_distance: bpy.props.FloatProperty(name="Gap", default=0.05, min=0.0)
 
+
+class ExportProperties(bpy.types.PropertyGroup):
+    output_dir: bpy.props.StringProperty(
+        name="Output Dir",
+        description="Directory to save outputs (JSON + render JPG). Defaults to the blend folder.",
+        default="//",
+        subtype='DIR_PATH'
+    )
+    base_name: bpy.props.StringProperty(
+        name="Base Name",
+        description="Base filename (without extension) for outputs",
+        default="synth",
+    )
+    export_render_jpg: bpy.props.BoolProperty(
+        name="Export Render (JPG)",
+        description="Also render the current scene and save as JPG into Output Dir",
+        default=True,
+    )
+
+    min_visible_ratio: bpy.props.FloatProperty(
+        name="Min Visible Ratio",
+        description="Export only objects with visible_proxy/total_proxy >= this threshold",
+        default=0.05,
+        min=0.0,
+        max=1.0,
+    )
+
+
 class VIEW3D_PT_gen_panel(bpy.types.Panel):
     bl_space_type, bl_region_type, bl_category, bl_label = 'VIEW_3D', 'UI', "Synth Retail", "Generator Settings"
 
@@ -409,19 +775,38 @@ class VIEW3D_PT_gen_panel(bpy.types.Panel):
         layout.scale_y = 1.0
         layout.operator("mesh.generate_boxes_on_face", text="Generate Objects" if props.source_object else "Generate Boxes", icon='PARTICLES')
 
+        layout.separator()
+        export_props = context.scene.export_props
+        box = layout.box()
+        box.label(text="Export", icon='EXPORT')
+        box.prop(export_props, "output_dir")
+        box.prop(export_props, "base_name")
+        box.prop(export_props, "export_render_jpg")
+        box.prop(export_props, "min_visible_ratio")
+        box.operator("scene.export_synth_bboxes", icon='IMAGE_DATA')
+
 # ------------------------------------------------------------------------
 # Registration
 # ------------------------------------------------------------------------
 
-classes = (MESH_OT_GenerateBoxesOnFace, MESH_OT_SubdivideFaceLongEdge, GenProperties, VIEW3D_PT_gen_panel)
+classes = (
+    MESH_OT_GenerateBoxesOnFace,
+    MESH_OT_SubdivideFaceLongEdge,
+    SCENE_OT_ExportSynthBBoxes,
+    GenProperties,
+    ExportProperties,
+    VIEW3D_PT_gen_panel,
+)
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.gen_props = bpy.props.PointerProperty(type=GenProperties)
+    bpy.types.Scene.export_props = bpy.props.PointerProperty(type=ExportProperties)
 
 def unregister():
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
     del bpy.types.Scene.gen_props
+    del bpy.types.Scene.export_props
 
 
 if __name__ == "__main__":
