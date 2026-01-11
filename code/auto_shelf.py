@@ -1,10 +1,10 @@
 bl_info = {
     "name": "货架大师 (Shelf Master CN)", 
     "author": "Gemini Assistant",
-    "version": (2, 2),
+    "version": (2, 3),
     "blender": (3, 0, 0),
     "location": "3D视图 > N面板 > 货架大师",
-    "description": "自动理货插件：拟真销售缺货逻辑 (外侧优先空缺)",
+    "description": "自动理货插件：真实库存逻辑 (不重复、自动留白)",
     "category": "Object",
 }
 
@@ -31,17 +31,13 @@ class SM_Properties(PropertyGroup):
     
     gap: FloatProperty(name="基础间距", default=0.005, min=0.001, max=1.0, subtype='DISTANCE')
     
-    # 修改描述：这里的缺货率现在代表“平均销售量”
+    # 销售模拟
     vacancy_rate: FloatProperty(
         name="销售程度 (缺货率)", 
-        description="数值越高，外侧空的越多。0为满货，1为全空。",
+        description="数值越高，外侧空的越多",
         default=0.2, min=0.0, max=1.0, subtype='FACTOR'
     )
-    invert_front: BoolProperty(
-        name="翻转前后方向", 
-        description="如果发现里面空了外面满的，请勾选此项",
-        default=False
-    )
+    invert_front: BoolProperty(name="翻转前后方向", default=False)
     
     jitter_rot: FloatProperty(name="随机旋转幅度", default=0.1, min=0.0, max=3.14)
     jitter_pos: FloatProperty(name="随机位置抖动", default=0.01, min=0.0, max=0.2, subtype='DISTANCE')
@@ -148,40 +144,48 @@ class OT_GenerateShelfItems(Operator):
         
         depsgraph = context.evaluated_depsgraph_get()
         
-        # --- 规划排面 ---
+        # --- 规划排面 (v2.3 不重复逻辑) ---
         shelf_plan = []
         plan_start = min_x if is_long_axis_x else min_y
         plan_end = max_x if is_long_axis_x else max_y
         current_p = plan_start
-        
-        # v2.2 新增：记录每一组排面的库存剩余量 (Stock Level)
-        # Key: segment_index, Value: 0.0~1.0 (表示这一组货还剩多少百分比)
         segment_stock_levels = []
         
+        # 1. 创建待摆放队列 (复制一份并打乱)
+        product_queue = products[:]
+        random.shuffle(product_queue) # 随机排序
+        
         if props.use_grouping:
-            while current_p < plan_end:
-                prod = random.choice(products)
+            # 2. 遍历队列，摆完为止
+            for prod in product_queue:
+                # 如果货架满了，停止摆放
+                if current_p >= plan_end:
+                    break
+                
                 facings = random.randint(props.facing_min, props.facing_max)
                 segment_len = facings * grid_step
+                
                 end_p = current_p + segment_len
+                
+                # 可选：如果这一组超出了货架边缘，是否截断？
+                # 目前逻辑是允许最后这组超出一点点（扫描时会自动裁剪），或者只要起点在范围内就摆
+                
                 shelf_plan.append({'end': end_p, 'obj': prod})
                 
-                # 为这一组生成一个随机的库存量
-                # 如果 vacancy_rate 是 0.2，那么库存大约在 0.6 ~ 1.0 之间浮动
-                # 这样每组的缺货程度不一样，更自然
+                # 随机库存
                 random_loss = random.uniform(0.0, props.vacancy_rate * 2.0)
                 stock_percent = max(0.0, 1.0 - random_loss)
                 segment_stock_levels.append(stock_percent)
                 
                 current_p = end_p
+                
+            # 循环结束后，如果 current_p 还不到 plan_end，剩下的部分自然就是空的
         
         # 网格扫描
         x_range = len_x
         y_range = len_y
         cols = int(x_range / grid_step)
         rows = int(y_range / grid_step)
-        
-        # 计算深度方向的最大步数 (用于归一化计算缺货)
         max_depth_steps = rows if is_long_axis_x else cols
         
         ray_start_z_limit = max_z + 1.0
@@ -193,50 +197,43 @@ class OT_GenerateShelfItems(Operator):
                 
                 base_x = min_x + (c * grid_step) + (grid_step / 2)
                 base_y = min_y + (r * grid_step) + (grid_step / 2)
-                
-                # --- v2.2 真实缺货逻辑 ---
                 check_coord = base_x if is_long_axis_x else base_y
                 
-                # 确定当前深度 (0.0 ~ 1.0)
-                # 如果 X 是主轴，则 Y 是深度轴
+                # 深度计算
                 if is_long_axis_x:
                     current_depth_idx = r
                 else:
                     current_depth_idx = c
-                
                 depth_ratio = current_depth_idx / max(1, max_depth_steps)
-                
-                # 处理翻转
-                if props.invert_front:
-                    depth_ratio = 1.0 - depth_ratio
+                if props.invert_front: depth_ratio = 1.0 - depth_ratio
 
                 target_product = None
                 allow_placement = True
                 
                 if props.use_grouping:
                     seg_idx = -1
+                    # 查表
                     for i, segment in enumerate(shelf_plan):
                         if check_coord <= segment['end']:
                             target_product = segment['obj']
                             seg_idx = i
                             break
-                    if target_product is None and len(shelf_plan) > 0:
-                        target_product = shelf_plan[-1]['obj']
-                        seg_idx = len(shelf_plan) - 1
                     
-                    # 检查库存限制
-                    # 如果当前深度 > 该组的库存量，说明这里已经卖空了
+                    # 重点修改：如果超出了所有plan的范围，就不摆了 (None)
+                    # 之前的版本是 target_product = shelf_plan[-1]，现在删掉这行
+                    
+                    if target_product is None:
+                        continue # 这里空着
+                    
                     if seg_idx >= 0:
                         stock_limit = segment_stock_levels[seg_idx]
-                        # 比如 stock_limit 是 0.8，意味着 0.0~0.8 (里面) 有货，0.8~1.0 (外面) 空着
-                        # 假设 depth_ratio 0 是里面，1 是外面
-                        # 如果 depth_ratio > stock_limit: 空缺
                         if depth_ratio > stock_limit:
                             allow_placement = False
                 else:
-                    # 不分组模式下的缺货逻辑 (随机生成一个limit)
+                    # 不分组模式下，依然保持随机选择（不分组就意味着杂乱，重复无所谓）
+                    # 如果你也希望不分组模式下也不重复，逻辑会变得很奇怪（变成完全随机的马赛克）
+                    # 所以不分组模式维持原样，只在分组模式应用“不重复”
                     target_product = random.choice(products)
-                    # 简单处理：全局统一缺货线 + 随机扰动
                     indiv_stock = 1.0 - (random.uniform(0.0, props.vacancy_rate * 2.0))
                     if depth_ratio > indiv_stock:
                         allow_placement = False
@@ -307,7 +304,7 @@ class OT_GenerateShelfItems(Operator):
 
 # --- 3. UI 面板 ---
 class PT_ShelfMasterPanel(Panel):
-    bl_label = "货架大师 v2.2 (真实缺货)"
+    bl_label = "货架大师 v2.3 (不重复版)"
     bl_idname = "VIEW3D_PT_shelf_master_cn"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -337,17 +334,15 @@ class PT_ShelfMasterPanel(Panel):
             row.label(text="排面宽度 (列数):")
             row.prop(props, "facing_min", text="Min")
             row.prop(props, "facing_max", text="Max")
+            box.label(text="* 商品不重复，摆完即止", icon='RESTRICT_SELECT_OFF')
 
         layout.separator()
 
-        layout.label(text="拟真销售 (缺货控制):", icon='GRAPH')
+        layout.label(text="拟真销售:", icon='GRAPH')
         col = layout.column()
-        # 缺货率滑杆
         col.prop(props, "vacancy_rate", slider=True, text="销售程度")
-        # 翻转按钮
         row = col.row()
         row.prop(props, "invert_front", text="翻转前后方向", icon='FILE_REFRESH')
-        col.label(text="* 缺货仅发生在外侧", icon='RIGHTARROW_THIN')
 
         layout.separator()
 
