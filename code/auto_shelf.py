@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "货架大师 (Shelf Master v3.7)", 
+    "name": "货架大师 (Shelf Master v3.8)", 
     "author": "Gemini Assistant",
-    "version": (3, 7),
+    "version": (3, 8),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > 货架大师",
-    "description": "v3.7: 添加可折叠UI面板，边界控制和边缘优先摆放",
+    "description": "v3.8: 添加价签自动生成功能，支持层板前沿检测和均匀分布",
     "category": "Object",
 }
 
@@ -36,6 +36,7 @@ class SM_Properties_v34(PropertyGroup):
     edge_margin_y: FloatProperty(name="前后边界留空", default=0.02, min=0.0, max=0.5, description="沿货架深度方向的边界留空")
     prefer_edges: BoolProperty(name="优先边缘摆放", default=False, description="商品尽量远离货架中心")
     safety_margin: FloatProperty(name="防穿模系数", default=1.05, min=1.0, max=2.0)
+    allow_overflow_stack: BoolProperty(name="允许超出货架高度", default=True, description="用于地堆/下凹层板，允许堆叠超过货架整体高度")
     # UI折叠控制
     ui_fold_stacking: BoolProperty(name="", default=True)
     ui_fold_grouping: BoolProperty(name="", default=True)
@@ -45,11 +46,22 @@ class SM_Properties_v34(PropertyGroup):
     facing_min: IntProperty(name="排面Min", default=2, min=1)
     facing_max: IntProperty(name="排面Max", default=5, min=1)
     use_stacking: BoolProperty(name="允许垂直堆叠", default=False)
-    max_stack: IntProperty(name="最大堆叠数", default=3, min=1, max=10) 
+    max_stack: IntProperty(name="最大堆叠数", default=3, min=1, max=10)
     check_height: BoolProperty(name="启用高度检测", default=True)
     top_gap_ratio: FloatProperty(name="顶部留空", default=0.05, min=0.0, max=0.5)
     check_isolated: BoolProperty(name="过滤孤立排", default=True, description="跳过货架顶部或过窄的单行位置")
     seed: IntProperty(name="随机种子", default=42, min=-1)
+    # 价签相关属性
+    ui_fold_pricetag: BoolProperty(name="", default=True)
+    pricetag_enabled: BoolProperty(name="启用价签生成", default=True)
+    pricetag_spacing: FloatProperty(name="价签间距", default=0.15, min=0.05, max=1.0, description="相邻价签之间的距离")
+    pricetag_width: FloatProperty(name="价签宽度", default=0.06, min=0.01, max=0.3)
+    pricetag_height: FloatProperty(name="价签高度", default=0.04, min=0.01, max=0.2)
+    pricetag_offset: FloatProperty(name="价签前伸距离", default=0.01, min=0.0, max=0.1, description="价签从层板前沿向外伸出的距离")
+    pricetag_vertical_offset: FloatProperty(name="价签垂直偏移", default=-0.005, min=-0.05, max=0.05, description="价签相对层板底部的垂直偏移")
+    pricetag_auto_orient: BoolProperty(name="自动朝向相机", default=False, description="价签始终朝向活动相机")
+    pricetag_jitter_x: FloatProperty(name="价签水平抖动", default=0.01, min=0.0, max=0.1, description="价签沿货架长度方向的随机偏移")
+    pricetag_jitter_z: FloatProperty(name="价签垂直抖动", default=0.002, min=0.0, max=0.05, description="价签沿Z轴的随机偏移")
 
 class OT_ClearShelfItems_v34(Operator):
     bl_idname = "object.sm_clear_items_v34"
@@ -57,7 +69,7 @@ class OT_ClearShelfItems_v34(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        targets = [COLLECTION_NAME, "SM_Stocked_Products_Final"]
+        targets = [COLLECTION_NAME, "SM_Stocked_Products_Final", "SM_PriceTags"]
         for t_name in targets:
             if t_name in bpy.data.collections:
                 col = bpy.data.collections[t_name]
@@ -153,16 +165,34 @@ class OT_GenerateShelfItems_v34(Operator):
         # 向上射线检测，找到最近的遮挡物（包括货架的上层板）
         offsets = [Vector((0,0,0)), Vector((radius*0.5,0,0)), Vector((-radius*0.5,0,0)), Vector((0,radius*0.5,0)), Vector((0,-radius*0.5,0))]
         min_headroom = 999.0
+        shelf_original = shelf_obj.original if hasattr(shelf_obj, "original") else shelf_obj
         for off in offsets:
             start_p = center_pos + off + Vector((0, 0, 0.02))
-            res, loc, _, _, obj, _ = scene.ray_cast(depsgraph, start_p, Vector((0, 0, 1)))
-            if res:
+            ray_dir = Vector((0, 0, 1))
+            # 可能先击中竖直面（背板/侧板）或其他物体，需要跳过并继续向上检测
+            for _ in range(6):
+                res, loc, norm, _, obj, _ = scene.ray_cast(depsgraph, start_p, ray_dir)
+                if not res:
+                    break
+                hit_obj = obj.original if hasattr(obj, "original") else obj
+                if hit_obj != shelf_original:
+                    start_p = loc + Vector((0, 0, 0.002))
+                    continue
+                if abs(norm.z) < 0.8:
+                    start_p = loc + Vector((0, 0, 0.002))
+                    continue
                 dist = loc.z - center_pos.z
                 if dist > 0.03 and dist < min_headroom:
                     min_headroom = dist
+                break
+
         if min_headroom > 900:
-            shelf_top_z = max([(shelf_obj.matrix_world @ Vector(c)).z for c in shelf_obj.bound_box])
-            min_headroom = shelf_top_z - center_pos.z
+            # 未命中上层水平面：可选择允许超出货架整体高度（地堆/下凹层板）
+            if getattr(scene.sm_props_v34, "allow_overflow_stack", True):
+                min_headroom = 999.0
+            else:
+                shelf_top_z = max([(shelf_obj.matrix_world @ Vector(c)).z for c in shelf_obj.bound_box])
+                min_headroom = max(0.0, shelf_top_z - center_pos.z)
         return min_headroom
 
     def check_floor_robust(self, scene, depsgraph, center_pos, radius, shelf_obj):
@@ -243,6 +273,210 @@ class OT_GenerateShelfItems_v34(Operator):
         depth_vec.z = 0
         return depth_vec.normalized()
 
+    def get_shelf_front_normal(self, shelf, invert_front=False):
+        # 获取统一的货架前方向量（用于价签朝向/偏移）
+        front_normal = self.get_depth_direction(shelf)
+        if invert_front:
+            front_normal = -front_normal
+        return front_normal.normalized()
+
+    def find_shelf_front_edges(self, shelf, depsgraph, invert_front=False):
+        """检测货架层板前沿边缘（考虑旋转与前后翻转）"""
+        # 获取货架的评估后mesh数据
+        shelf_eval = shelf.evaluated_get(depsgraph)
+        mesh = shelf_eval.to_mesh()
+        
+        # 转换到世界坐标
+        mat = shelf.matrix_world
+        
+        # 找到所有水平边缘（层板边缘）
+        horizontal_edges = []
+        
+        for edge in mesh.edges:
+            v1 = mat @ mesh.vertices[edge.vertices[0]].co
+            v2 = mat @ mesh.vertices[edge.vertices[1]].co
+            
+            # 检查是否为水平边（Z坐标相近）
+            if abs(v1.z - v2.z) < 0.01:
+                edge_vec = (v2 - v1).normalized()
+                edge_length = (v2 - v1).length
+                
+                # 找到边的中点
+                mid_point = (v1 + v2) / 2
+                
+                # 只保留较长的边（至少10cm）
+                if edge_length > 0.1:
+                    horizontal_edges.append({
+                        'start': v1,
+                        'end': v2,
+                        'mid': mid_point,
+                        'length': edge_length,
+                        'direction': edge_vec,
+                        'z': mid_point.z
+                    })
+        
+        shelf_eval.to_mesh_clear()
+        
+        # 按Z坐标分组（同一层板）
+        edge_groups = {}
+        for edge in horizontal_edges:
+            z_key = round(edge['z'] / 0.05) * 0.05
+            if z_key not in edge_groups:
+                edge_groups[z_key] = []
+            edge_groups[z_key].append(edge)
+        
+        # 对每一层找出前沿边缘（沿货架深度方向最前的边）
+        front_edges = []
+        shelf_center = shelf.matrix_world.to_translation()
+        front_dir = self.get_shelf_front_normal(shelf, invert_front)
+        
+        for z_level, edges in edge_groups.items():
+            if not edges:
+                continue
+            
+            # 使用深度方向投影选择最前沿的边
+            def depth_score(edge):
+                edge_mid_2d = Vector((edge['mid'].x, edge['mid'].y, 0))
+                center_2d = Vector((shelf_center.x, shelf_center.y, 0))
+                return (edge_mid_2d - center_2d).dot(front_dir)
+
+            front_edges.append(max(edges, key=depth_score))
+        
+        return front_edges
+    
+    def generate_pricetags(self, context, shelf, props, depsgraph, segment_info):
+        """为每个segment（商品分组）在层板前沿生成价签"""
+        scene = context.scene
+        
+        # 创建或获取价签集合
+        col_name = "SM_PriceTags"
+        if col_name not in bpy.data.collections:
+            tag_col = bpy.data.collections.new(col_name)
+            scene.collection.children.link(tag_col)
+        else:
+            tag_col = bpy.data.collections[col_name]
+        
+        if not segment_info:
+            return 0
+        
+        # 查找货架前沿边缘
+        front_edges = self.find_shelf_front_edges(shelf, depsgraph, props.invert_front)
+        
+        if not front_edges:
+            return 0
+        
+        tag_count = 0
+        camera = scene.camera
+        front_normal = self.get_shelf_front_normal(shelf, props.invert_front)
+        
+        # 为每个segment生成一个价签
+        for seg_id, seg_data in segment_info.items():
+            # 获取该segment的中心位置
+            seg_center = seg_data['center']
+            seg_z = seg_data['z_level']
+            seg_min_proj = seg_data.get('min_proj', None)
+            seg_max_proj = seg_data.get('max_proj', None)
+            seg_length_axis = seg_data.get('length_axis', None)
+            
+            # 找到最接近的前沿边缘（同一层）
+            best_edge = None
+            min_dist = float('inf')
+            
+            for edge_info in front_edges:
+                edge_z = edge_info['z']
+                # 检查Z高度是否匹配
+                if abs(edge_z - seg_z) < 0.05:
+                    # 计算segment中心到边缘的距离
+                    edge_mid = edge_info['mid']
+                    dist = (Vector((seg_center.x, seg_center.y, edge_z)) - edge_mid).length
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_edge = edge_info
+            
+            if not best_edge:
+                continue
+            
+            # 计算价签位置：在segment中心X/Y位置，边缘的Z高度
+            edge_start = best_edge['start']
+            edge_end = best_edge['end']
+            edge_dir = best_edge['direction']
+            edge_z = best_edge['z']
+            
+            # 将segment中心投影到边缘线上
+            seg_center_2d = Vector((seg_center.x, seg_center.y, edge_z))
+            edge_vec = edge_end - edge_start
+            t = max(0.0, min(1.0, (seg_center_2d - edge_start).dot(edge_vec) / edge_vec.length_squared))
+            tag_pos = edge_start.lerp(edge_end, t)
+
+            # 价签随机抖动（水平需限制在segment边界内）
+            seed_val = sum(ord(c) for c in str(seg_id)) + int(seg_z * 1000)
+            jitter_rng = random.Random(seed_val)
+            if props.pricetag_jitter_x > 0 and seg_min_proj is not None and seg_max_proj is not None and seg_length_axis is not None:
+                sign = 1.0 if edge_dir.dot(seg_length_axis) >= 0 else -1.0
+                # 将segment边界投影到edge_dir方向
+                min_edge = seg_min_proj * sign
+                max_edge = seg_max_proj * sign
+                if min_edge > max_edge:
+                    min_edge, max_edge = max_edge, min_edge
+                cur_proj = tag_pos.dot(edge_dir)
+                jitter = jitter_rng.uniform(-props.pricetag_jitter_x, props.pricetag_jitter_x)
+                new_proj = max(min_edge, min(max_edge, cur_proj + jitter))
+                tag_pos += edge_dir * (new_proj - cur_proj)
+            if props.pricetag_jitter_z > 0:
+                tag_pos.z += jitter_rng.uniform(-props.pricetag_jitter_z, props.pricetag_jitter_z)
+            
+            # 应用偏移
+            tag_pos += front_normal * props.pricetag_offset
+            tag_pos.z += props.pricetag_vertical_offset
+            
+            # 创建价签（简单平面）
+            bpy.ops.mesh.primitive_plane_add(size=1, location=tag_pos)
+            tag_obj = context.active_object
+            sku_name = seg_data['sku_name']
+            tag_obj.name = f"PriceTag_{sku_name}_{tag_count:03d}"
+            
+            # 设置尺寸
+            tag_obj.scale.x = props.pricetag_width / 2
+            tag_obj.scale.y = props.pricetag_height / 2
+            tag_obj.scale.z = 0.001
+            
+            # 设置朝向 - 使用边缘法线对齐
+            if props.pricetag_auto_orient and camera:
+                # 朝向相机
+                cam_dir = (camera.location - tag_pos).normalized()
+                cam_dir.z = 0
+                if cam_dir.length > 0.01:
+                    cam_dir.normalize()
+                    tag_obj.rotation_euler = cam_dir.to_track_quat('-Z', 'Y').to_euler()
+            else:
+                # 朝向边缘法线方向
+                tag_obj.rotation_euler = front_normal.to_track_quat('-Z', 'Y').to_euler()
+            
+            # 创建简单材质（白色背景）
+            mat = bpy.data.materials.new(name=f"PriceTag_Mat_{tag_count}")
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            nodes.clear()
+            
+            # 发光shader（便于可见）
+            emission = nodes.new('ShaderNodeEmission')
+            emission.inputs['Color'].default_value = (1.0, 1.0, 0.9, 1.0)  # 淡黄色
+            emission.inputs['Strength'].default_value = 1.5
+            
+            output = nodes.new('ShaderNodeOutputMaterial')
+            mat.node_tree.links.new(emission.outputs['Emission'], output.inputs['Surface'])
+            
+            tag_obj.data.materials.append(mat)
+            
+            # 移动到价签集合
+            for col in tag_obj.users_collection:
+                col.objects.unlink(tag_obj)
+            tag_col.objects.link(tag_obj)
+            
+            tag_count += 1
+        
+        return tag_count
+
     def execute(self, context):
         try: return self.safe_execute(context)
         except Exception as e:
@@ -307,12 +541,17 @@ class OT_GenerateShelfItems_v34(Operator):
             context.scene.collection.children.link(stock_col)
         else:
             stock_col = bpy.data.collections[COLLECTION_NAME]
+        
         depsgraph = context.evaluated_depsgraph_get()
         length_margin = props.edge_margin_x if is_local_x_long else props.edge_margin_y
         usable_length = max(0.0, max_length - (length_margin * 2.0))
         plan_start, plan_end = -usable_length / 2.0, usable_length / 2.0
         ray_start_z = max_z + 1.0
         total_count, placed_items, level_plans = 0, [], {}
+        
+        # 追踪每个segment的位置信息（用于生成价签）
+        segment_info = {}  # {seg_id: {'center': Vector, 'z_level': z, 'sku_name': name, 'count': n, 'min_proj': v, 'max_proj': v}}
+        segment_counter = 0
         
         # 生成所有格子坐标
         grid_cells = []
@@ -420,15 +659,61 @@ class OT_GenerateShelfItems_v34(Operator):
                             )
                             if placed:
                                 total_count += 1
+                                # 更新segment位置信息
+                                if props.use_grouping and seg_idx >= 0:
+                                    seg_key = f"{level_key}_{seg_idx}"
+                                    if seg_key not in segment_info:
+                                        segment_info[seg_key] = {
+                                            'positions': [],
+                                            'z_level': loc.z,
+                                            'sku_name': target.name,
+                                            'count': 0,
+                                            'min_proj': None,
+                                            'max_proj': None
+                                        }
+                                    segment_info[seg_key]['positions'].append(base_loc)
+                                    segment_info[seg_key]['count'] += 1
+                                    proj = base_loc.dot(length_axis)
+                                    if segment_info[seg_key]['min_proj'] is None or proj < segment_info[seg_key]['min_proj']:
+                                        segment_info[seg_key]['min_proj'] = proj
+                                    if segment_info[seg_key]['max_proj'] is None or proj > segment_info[seg_key]['max_proj']:
+                                        segment_info[seg_key]['max_proj'] = proj
                             else:
                                 break
                     cur_ray_z = next_ray_z
         self.report({'INFO'}, f"生成完毕: {total_count} 个")
+        
+        # 生成价签
+        if props.pricetag_enabled and segment_info:
+            # 计算每个segment的中心位置
+            segment_centers = {}
+            for seg_key, seg_data in segment_info.items():
+                positions = seg_data['positions']
+                if positions:
+                    # 计算所有位置的平均值作为中心
+                    avg_pos = Vector((0, 0, 0))
+                    for pos in positions:
+                        avg_pos += pos
+                    avg_pos /= len(positions)
+                    segment_centers[seg_key] = {
+                        'center': avg_pos,
+                        'z_level': seg_data['z_level'],
+                        'sku_name': seg_data['sku_name'],
+                        'count': seg_data['count'],
+                        'min_proj': seg_data['min_proj'],
+                        'max_proj': seg_data['max_proj'],
+                        'length_axis': length_axis
+                    }
+            
+            pricetag_count = self.generate_pricetags(context, shelf, props, depsgraph, segment_centers)
+            if pricetag_count > 0:
+                self.report({'INFO'}, f"已生成 {pricetag_count} 个价签（{len(segment_centers)} 个segment）")
+        
         return {'FINISHED'}
 
 class PT_ShelfMasterPanel_v34(Panel):
     # UI 面板
-    bl_label = "货架大师 v3.7"
+    bl_label = "货架大师 v3.8"
     bl_idname = "VIEW3D_PT_shelf_master_v34"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -453,6 +738,7 @@ class PT_ShelfMasterPanel_v34(Panel):
             box.prop(props, "use_stacking")
             if props.use_stacking: box.prop(props, "max_stack")
             box.prop(props, "top_gap_ratio", slider=True, text="顶部留空")
+            box.prop(props, "allow_overflow_stack")
             box.prop(props, "check_isolated")
         
         # 排面与销售 (可折叠)
@@ -489,6 +775,26 @@ class PT_ShelfMasterPanel_v34(Panel):
             box.prop(props, "edge_margin_y")
             box.prop(props, "prefer_edges")
 
+        # 价签设置 (可折叠)
+        row = layout.row()
+        row.prop(props, "ui_fold_pricetag", icon="TRIA_DOWN" if props.ui_fold_pricetag else "TRIA_RIGHT", emboss=False)
+        row.label(text="价签设置:", icon='BOOKMARKS')
+        if props.ui_fold_pricetag:
+            box = layout.box()
+            box.prop(props, "pricetag_enabled")
+            if props.pricetag_enabled:
+                box.prop(props, "pricetag_spacing")
+                row = box.row(align=True)
+                row.prop(props, "pricetag_width")
+                row.prop(props, "pricetag_height")
+                box.prop(props, "pricetag_offset")
+                box.prop(props, "pricetag_vertical_offset")
+                row = box.row(align=True)
+                row.prop(props, "pricetag_jitter_x")
+                row.prop(props, "pricetag_jitter_z")
+                box.prop(props, "pricetag_auto_orient")
+        
+        layout.separator()
         col = layout.column(align=True)
         col.operator("object.sm_generate_items_v34", icon='PLAY', text="生成布局")
         col.operator("object.sm_clear_items_v34", icon='TRASH', text="一键清空")
