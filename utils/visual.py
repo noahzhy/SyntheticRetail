@@ -2,8 +2,8 @@
 
 Expected label JSON format (list):
 [
-  {"label": "Can.006", "bbox": [xmin, ymin, xmax, ymax], ...},
-  ...
+    {"label": "Can.006", "bbox": [xmin, ymin, xmax, ymax], ...},
+    ...
 ]
 
 The bbox can be either:

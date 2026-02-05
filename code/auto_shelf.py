@@ -85,9 +85,21 @@ class OT_GenerateShelfItems_v34(Operator):
     bl_label = "生成布局"
     bl_options = {'REGISTER', 'UNDO'}
 
+    def get_obj_footprint(self, obj):
+        # 仅使用底边(X/Y)包围盒尺寸，返回半宽/半深
+        bbox = [Vector(v) for v in obj.bound_box]
+        min_x = min(v.x for v in bbox)
+        max_x = max(v.x for v in bbox)
+        min_y = min(v.y for v in bbox)
+        max_y = max(v.y for v in bbox)
+        width = (max_x - min_x) * obj.scale.x
+        depth = (max_y - min_y) * obj.scale.y
+        return width * 0.5, depth * 0.5
+
     def get_obj_radius(self, obj, mode):
-        width, depth = obj.dimensions.x, obj.dimensions.y
-        return max(width, depth) / 2.0 if mode == 'CYLINDER' else math.sqrt(width**2 + depth**2) / 2.0
+        # 用于射线检测的半径，取底边最大半径
+        half_w, half_d = self.get_obj_footprint(obj)
+        return max(half_w, half_d)
 
     def get_obj_dims(self, obj):
         return obj.dimensions
@@ -97,10 +109,21 @@ class OT_GenerateShelfItems_v34(Operator):
         min_z_local = min([v.z for v in bbox])
         return abs(min_z_local) * obj.scale.z
 
-    def place_item_simple(self, stock_col, target, base_loc, item_height, item_z_offset, target_radius, placed_items, props, rng, max_attempts=6):
+    def compute_grid_step(self, footprints, props):
+        # 使用底边短边的较低分位作为网格步长，保证长方体更紧凑
+        if not footprints:
+            return 0.0
+        short_sides = [min(hw, hd) * 2.0 for hw, hd in footprints]
+        short_sorted = sorted(short_sides)
+        p_idx = int((len(short_sorted) - 1) * 0.6)
+        base_size = short_sorted[p_idx]
+        return base_size + props.gap
+
+    def place_item_simple(self, stock_col, target, base_loc, item_height, item_z_offset, target_half_w, target_half_d, placed_items, props, rng, max_attempts=6):
         # 简化注释，保留必要说明
         # 放置商品，避免穿模
-        effective_radius = target_radius
+        half_w = target_half_w
+        half_d = target_half_d
         EPSILON = 0.001
         for _ in range(max_attempts):
             jx = rng.uniform(-props.jitter_pos, props.jitter_pos)
@@ -110,17 +133,19 @@ class OT_GenerateShelfItems_v34(Operator):
             # 预计算新物体的上下边界
             z_bottom_new = bottom_pos.z + EPSILON
             z_top_new = bottom_pos.z + item_height - EPSILON
-            for pp, pr, ph in placed_items:
+            for pp, pw, pd, ph in placed_items:
                 # 现有物体的上下边界
                 z_bottom_old = pp.z
                 z_top_old = pp.z + ph
                 # Z轴碰撞检测（AABB重叠）
                 is_z_overlap = (z_bottom_new < z_top_old) and (z_top_new > z_bottom_old)
                 if is_z_overlap:
-                    dist_2d = (Vector((pp.x, pp.y)) - Vector((bottom_pos.x, bottom_pos.y))).length
-                    # 距离 >= (新半径 + 旧半径) * 安全系数
-                    min_safe_dist = (effective_radius + pr) * props.safety_margin
-                    if dist_2d < min_safe_dist:
+                    # XY AABB 碰撞检测（适合长方体，更紧凑）
+                    dx = abs(pp.x - bottom_pos.x)
+                    dy = abs(pp.y - bottom_pos.y)
+                    limit_x = (half_w + pw) * props.safety_margin
+                    limit_y = (half_d + pd) * props.safety_margin
+                    if dx < limit_x and dy < limit_y:
                         has_collision = True
                         break
             if has_collision:
@@ -130,7 +155,7 @@ class OT_GenerateShelfItems_v34(Operator):
             stock_col.objects.link(new_o)
             new_o.location = Vector((bottom_pos.x, bottom_pos.y, bottom_pos.z + item_z_offset))
             new_o.rotation_euler.z = target.rotation_euler.z + rng.uniform(-props.jitter_rot, props.jitter_rot)
-            placed_items.append((bottom_pos, effective_radius, item_height))
+            placed_items.append((bottom_pos, half_w, half_d, item_height))
             return True
         return False
 
@@ -433,7 +458,7 @@ class OT_GenerateShelfItems_v34(Operator):
             bpy.ops.mesh.primitive_plane_add(size=1, location=tag_pos)
             tag_obj = context.active_object
             sku_name = seg_data['sku_name']
-            tag_obj.name = f"PriceTag_{sku_name}_{tag_count:03d}"
+            tag_obj.name = f"PriceTag_SKU_{sku_name}_{tag_count:03d}"
             
             # 设置尺寸
             tag_obj.scale.x = props.pricetag_width / 2
@@ -497,14 +522,12 @@ class OT_GenerateShelfItems_v34(Operator):
         actual_seed = props.seed if props.seed != -1 else int(time.time() * 1000) % 1000000
         product_heights = {p.name: p.dimensions.z for p in all_products}
         product_z_offsets = {p.name: self.get_z_offset(p) for p in all_products}
-        max_safe_radius = max(self.get_obj_radius(p, props.shape_mode) for p in all_products)
-        grid_step = (max_safe_radius * 2) + props.gap
+        product_footprints = {p.name: self.get_obj_footprint(p) for p in all_products}
+        footprints = list(product_footprints.values())
+        grid_step = self.compute_grid_step(footprints, props)
         if grid_step <= 0.0001: return {'CANCELLED'}
         corners = [shelf.matrix_world @ Vector(c) for c in shelf.bound_box]
-        min_x, max_x = min([v.x for v in corners]), max([v.x for v in corners])
-        min_y, max_y = min([v.y for v in corners]), max([v.y for v in corners])
         max_z, min_z_bound = max([v.z for v in corners]), min([v.z for v in corners])
-        len_x, len_y = max_x - min_x, max_y - min_y
         local_dims = shelf.dimensions
         is_local_x_long = (local_dims.x >= local_dims.y)
         shelf_center = shelf.matrix_world.to_translation()
@@ -525,16 +548,12 @@ class OT_GenerateShelfItems_v34(Operator):
             depth_axis = local_x_world
             max_length = local_dims.y
             max_depth = local_dims.x
-        edge_x = max(0.0, props.edge_margin_x)
-        edge_y = max(0.0, props.edge_margin_y)
-        min_x += edge_x
-        max_x -= edge_x
-        min_y += edge_y
-        max_y -= edge_y
-        len_x = max(0.0, max_x - min_x)
-        len_y = max(0.0, max_y - min_y)
-        cols = int(len_x / grid_step)
-        rows = int(len_y / grid_step)
+        length_margin = props.edge_margin_x if is_local_x_long else props.edge_margin_y
+        depth_margin = props.edge_margin_y if is_local_x_long else props.edge_margin_x
+        usable_length = max(0.0, max_length - (length_margin * 2.0))
+        usable_depth = max(0.0, max_depth - (depth_margin * 2.0))
+        cols = int(usable_length / grid_step)
+        rows = int(usable_depth / grid_step)
         depth_direction = depth_axis if props.check_isolated else None
         if COLLECTION_NAME not in bpy.data.collections:
             stock_col = bpy.data.collections.new(COLLECTION_NAME)
@@ -543,8 +562,6 @@ class OT_GenerateShelfItems_v34(Operator):
             stock_col = bpy.data.collections[COLLECTION_NAME]
         
         depsgraph = context.evaluated_depsgraph_get()
-        length_margin = props.edge_margin_x if is_local_x_long else props.edge_margin_y
-        usable_length = max(0.0, max_length - (length_margin * 2.0))
         plan_start, plan_end = -usable_length / 2.0, usable_length / 2.0
         ray_start_z = max_z + 1.0
         total_count, placed_items, level_plans = 0, [], {}
@@ -553,18 +570,23 @@ class OT_GenerateShelfItems_v34(Operator):
         segment_info = {}  # {seg_id: {'center': Vector, 'z_level': z, 'sku_name': name, 'count': n, 'min_proj': v, 'max_proj': v}}
         segment_counter = 0
         
-        # 生成所有格子坐标
+        # 生成所有格子坐标（使用货架局部轴，保证分组按长度轴生效）
         grid_cells = []
+        length_start = -usable_length / 2.0 + (grid_step / 2.0)
+        depth_start = -usable_depth / 2.0 + (grid_step / 2.0)
         for r_idx in range(rows):
             for c_idx in range(cols):
-                base_x = min_x + (c_idx * grid_step) + (grid_step / 2)
-                base_y = min_y + (r_idx * grid_step) + (grid_step / 2)
-                grid_cells.append((r_idx, c_idx, base_x, base_y))
+                pos = (
+                    shelf_center
+                    + length_axis * (length_start + c_idx * grid_step)
+                    + depth_axis * (depth_start + r_idx * grid_step)
+                )
+                grid_cells.append((r_idx, c_idx, pos.x, pos.y))
         
         # 如果启用边缘优先，按距离中心由远到近排序
         if props.prefer_edges:
-            center_x = (min_x + max_x) / 2.0
-            center_y = (min_y + max_y) / 2.0
+            center_x = shelf_center.x
+            center_y = shelf_center.y
             grid_cells.sort(key=lambda cell: -((cell[2] - center_x)**2 + (cell[3] - center_y)**2)**0.5)
         
         # 遍历格子进行摆放
@@ -646,13 +668,15 @@ class OT_GenerateShelfItems_v34(Operator):
                         local_rng = random.Random(actual_seed + r_idx * 100 + c_idx + int(level_key * 50))
                         for k in range(stack_count):
                             base_loc = Vector((loc.x, loc.y, loc.z + (k * item_height)))
+                            half_w, half_d = product_footprints[target.name]
                             placed = self.place_item_simple(
                                 stock_col,
                                 target,
                                 base_loc,
                                 item_height,
                                 item_z_offset,
-                                target_radius,
+                                half_w,
+                                half_d,
                                 placed_items,
                                 props,
                                 local_rng,
