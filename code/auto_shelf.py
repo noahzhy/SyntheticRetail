@@ -16,7 +16,47 @@ from mathutils import Vector
 from bpy.props import FloatProperty, IntProperty, BoolProperty, PointerProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
-COLLECTION_NAME = "SM_Stocked_Products_Final"
+SKU_COLLECTION = "SM_Stocked_Products"
+TAG_COLLECTION = "SM_PriceTags"
+
+# 空间网格索引用于加速碰撞检测
+class SpatialGrid:
+    def __init__(self, cell_size=0.1):
+        self.cell_size = cell_size
+        self.grid = {}
+        self.items = []  # 存储所有物品，用于去重
+    
+    def _get_cell(self, x, y, z):
+        return (int(x / self.cell_size), int(y / self.cell_size), int(z / self.cell_size))
+    
+    def insert(self, pos, half_w, half_d, height):
+        # 存储为tuple避免Vector哈希问题
+        item_idx = len(self.items)
+        item = ((pos.x, pos.y, pos.z), half_w, half_d, height)
+        self.items.append(item)
+        # 插入到所有可能覆盖的单元格
+        min_cell = self._get_cell(pos.x - half_w, pos.y - half_d, pos.z)
+        max_cell = self._get_cell(pos.x + half_w, pos.y + half_d, pos.z + height)
+        for cx in range(min_cell[0], max_cell[0] + 1):
+            for cy in range(min_cell[1], max_cell[1] + 1):
+                for cz in range(min_cell[2], max_cell[2] + 1):
+                    key = (cx, cy, cz)
+                    if key not in self.grid:
+                        self.grid[key] = set()
+                    self.grid[key].add(item_idx)
+    
+    def query_nearby(self, pos, half_w, half_d, height):
+        # 查询该物体可能重叠的单元格（不需要额外扩展，因为insert已经覆盖了边界）
+        candidate_ids = set()
+        min_cell = self._get_cell(pos.x - half_w, pos.y - half_d, pos.z)
+        max_cell = self._get_cell(pos.x + half_w, pos.y + half_d, pos.z + height)
+        for cx in range(min_cell[0], max_cell[0] + 1):
+            for cy in range(min_cell[1], max_cell[1] + 1):
+                for cz in range(min_cell[2], max_cell[2] + 1):
+                    key = (cx, cy, cz)
+                    if key in self.grid:
+                        candidate_ids.update(self.grid[key])
+        return [self.items[i] for i in candidate_ids]
 
 class SM_Properties_v34(PropertyGroup):
     shape_mode: EnumProperty(
@@ -69,15 +109,25 @@ class OT_ClearShelfItems_v34(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        targets = [COLLECTION_NAME, "SM_Stocked_Products_Final", "SM_PriceTags"]
+        targets = {SKU_COLLECTION, TAG_COLLECTION}
+        objects_to_remove = []
+        
         for t_name in targets:
             if t_name in bpy.data.collections:
                 col = bpy.data.collections[t_name]
-                for obj in col.objects:
-                    try: bpy.data.objects.remove(obj, do_unlink=True)
-                    except: pass
-                bpy.data.collections.remove(col)
-        self.report({'INFO'}, "已清空。")
+                objects_to_remove.extend(list(col.objects))
+        
+        if objects_to_remove:
+            bpy.data.batch_remove(objects_to_remove)
+        
+        for col_name in list(targets):
+            try:
+                if col_name in bpy.data.collections:
+                    bpy.data.collections.remove(bpy.data.collections[col_name])
+            except ReferenceError:
+                pass
+        
+        self.report({'INFO'}, f"已清空 {len(objects_to_remove)} 个对象。")
         return {'FINISHED'}
 
 class OT_GenerateShelfItems_v34(Operator):
@@ -110,41 +160,65 @@ class OT_GenerateShelfItems_v34(Operator):
         return abs(min_z_local) * obj.scale.z
 
     def compute_grid_step(self, footprints, props):
-        # 使用底边短边的较低分位作为网格步长，保证长方体更紧凑
+        # 计算 Y 方向（深度）的统一网格步长，X 方向将动态计算
         if not footprints:
-            return 0.0
-        short_sides = [min(hw, hd) * 2.0 for hw, hd in footprints]
-        short_sorted = sorted(short_sides)
-        p_idx = int((len(short_sorted) - 1) * 0.6)
-        base_size = short_sorted[p_idx]
-        return base_size + props.gap
+            return 0.0, 0.0
+        
+        # Y轴（深度）：取最大值以保证对齐
+        # 使用 85% 分位数，避免个别极端大物体撑大所有行距，也不像之前60%那么挤
+        depths = [fp[1] * 2.0 for fp in footprints]
+        sorted_depths = sorted(depths)
+        p_idx = int((len(sorted_depths) - 1) * 0.85)
+        base_d = sorted_depths[p_idx]
+        
+        step_y = base_d * props.safety_margin + props.gap
+        
+        # X轴（长度）：为了避障检测，返回一个最小步长参考值
+        widths = [fp[0] * 2.0 for fp in footprints]
+        min_w = min(widths) if widths else 0.05
+        step_x_min = min_w * 0.5  # 扫描精度
+        
+        return step_x_min, step_y
 
-    def place_item_simple(self, stock_col, target, base_loc, item_height, item_z_offset, target_half_w, target_half_d, placed_items, props, rng, max_attempts=6):
-        # 简化注释，保留必要说明
-        # 放置商品，避免穿模
+    def place_item_simple(self, stock_col, target, base_loc, item_height, item_z_offset, target_half_w, target_half_d, spatial_grid, props, rng, max_attempts=5):
+        # 使用自适应抖动策略：尝试多次，如果碰撞则减小抖动幅度
         half_w = target_half_w
         half_d = target_half_d
         EPSILON = 0.001
-        for _ in range(max_attempts):
-            jx = rng.uniform(-props.jitter_pos, props.jitter_pos)
-            jy = rng.uniform(-props.jitter_pos, props.jitter_pos)
+        
+        # 尝试序列：几次全抖动 -> 几次半抖动 -> 无抖动
+        scales = [1.0, 1.0, 0.5, 0.5, 0.0]
+        
+        for scale in scales:
+            if scale > 0.001:
+                jx = rng.uniform(-props.jitter_pos * scale, props.jitter_pos * scale)
+                jy = rng.uniform(-props.jitter_pos * scale, props.jitter_pos * scale)
+                # 旋转也随位置抖动幅度衰减
+                jr = rng.uniform(-props.jitter_rot * scale, props.jitter_rot * scale)
+            else:
+                jx, jy, jr = 0.0, 0.0, 0.0
+                
             bottom_pos = Vector((base_loc.x + jx, base_loc.y + jy, base_loc.z))
             has_collision = False
-            # 预计算新物体的上下边界
             z_bottom_new = bottom_pos.z + EPSILON
             z_top_new = bottom_pos.z + item_height - EPSILON
-            for pp, pw, pd, ph in placed_items:
-                # 现有物体的上下边界
-                z_bottom_old = pp.z
-                z_top_old = pp.z + ph
-                # Z轴碰撞检测（AABB重叠）
+            # 只检查附近的物体（空间索引加速）
+            nearby = spatial_grid.query_nearby(bottom_pos, half_w, half_d, item_height)
+            for pp, pw, pd, ph in nearby:
+                # pp 现在是 (x, y, z) tuple
+                pp_x, pp_y, pp_z = pp
+                z_bottom_old = pp_z
+                z_top_old = pp_z + ph
                 is_z_overlap = (z_bottom_new < z_top_old) and (z_top_new > z_bottom_old)
                 if is_z_overlap:
-                    # XY AABB 碰撞检测（适合长方体，更紧凑）
-                    dx = abs(pp.x - bottom_pos.x)
-                    dy = abs(pp.y - bottom_pos.y)
-                    limit_x = (half_w + pw) * props.safety_margin
-                    limit_y = (half_d + pd) * props.safety_margin
+                    dx = abs(pp_x - bottom_pos.x)
+                    dy = abs(pp_y - bottom_pos.y)
+                if is_z_overlap:
+                    dx = abs(pp_x - bottom_pos.x)
+                    dy = abs(pp_y - bottom_pos.y)
+                    # 碰撞判定：物理半径之和 + 极小容差(gap已经由外部控制位置了，这里只负责防穿模)
+                    limit_x = (half_w + pw) * 0.99 
+                    limit_y = (half_d + pd) * 0.99
                     if dx < limit_x and dy < limit_y:
                         has_collision = True
                         break
@@ -154,27 +228,48 @@ class OT_GenerateShelfItems_v34(Operator):
             new_o.data = target.data
             stock_col.objects.link(new_o)
             new_o.location = Vector((bottom_pos.x, bottom_pos.y, bottom_pos.z + item_z_offset))
-            new_o.rotation_euler.z = target.rotation_euler.z + rng.uniform(-props.jitter_rot, props.jitter_rot)
-            placed_items.append((bottom_pos, half_w, half_d, item_height))
+            new_o.rotation_euler.z = target.rotation_euler.z + jr
+            spatial_grid.insert(bottom_pos, half_w, half_d, item_height)
             return True
         return False
 
-    def generate_global_plan(self, products, plan_start, plan_end, grid_step, props, rng):
+    def generate_global_plan(self, products, plan_start, plan_end, props, rng, product_footprints):
+        # 基于动态宽度的布局规划
         if not products: return [], []
         product_queue = products[:]
         rng.shuffle(product_queue)
         shelf_plan = []
         segment_stock_levels = []
         current_p = plan_start
-        while current_p < plan_end:
+        
+        # 安全中止
+        loop_limit = 1000
+        
+        while current_p < plan_end and loop_limit > 0:
+            loop_limit -= 1
             if not product_queue: 
                 product_queue = products[:]
                 rng.shuffle(product_queue)
             prod = product_queue.pop(0)
+            
+            # 获取该商品的实际占用宽度 (纯物理尺寸 + 间隙)
+            half_w, _ = product_footprints[prod.name]
+            # 这里 unit_width 表示该商品占据的空间槽位宽度
+            unit_width = (half_w * 2.0) + props.gap
+            
             facings = rng.randint(props.facing_min, props.facing_max)
-            segment_len = facings * grid_step
+            segment_len = facings * unit_width
+            
             end_p = current_p + segment_len
-            shelf_plan.append({'end': end_p, 'obj': prod})
+            
+            # 记录该segment的信息：起止位置，商品对象，单品宽度
+            shelf_plan.append({
+                'start': current_p,
+                'end': end_p, 
+                'obj': prod,
+                'unit_width': unit_width
+            })
+            
             base_stock = 1.0 - props.vacancy_rate
             if props.vacancy_rate <= 0.001: stock_level = 1.0
             elif props.vacancy_rate >= 0.999: stock_level = 0.0
@@ -183,78 +278,68 @@ class OT_GenerateShelfItems_v34(Operator):
                 stock_level = max(0.0, min(1.0, base_stock + variation))
             segment_stock_levels.append(stock_level)
             current_p = end_p
+            
         return shelf_plan, segment_stock_levels
 
-    def check_headroom_robust(self, scene, depsgraph, center_pos, radius, shelf_obj):
-        # 检查从center_pos向上到上层货架板的实际空间
-        # 向上射线检测，找到最近的遮挡物（包括货架的上层板）
-        offsets = [Vector((0,0,0)), Vector((radius*0.5,0,0)), Vector((-radius*0.5,0,0)), Vector((0,radius*0.5,0)), Vector((0,-radius*0.5,0))]
+    def check_headroom_robust(self, scene, depsgraph, center_pos, radius, shelf_obj, headroom_cache=None):
+        # 使用缓存加速：同一层板的headroom相似
+        cache_key = round(center_pos.z / 0.05) * 0.05
+        if headroom_cache is not None and cache_key in headroom_cache:
+            return headroom_cache[cache_key]
+        
+        # 简化：只检测中心点（减少射线数量）
         min_headroom = 999.0
         shelf_original = shelf_obj.original if hasattr(shelf_obj, "original") else shelf_obj
-        for off in offsets:
-            start_p = center_pos + off + Vector((0, 0, 0.02))
-            ray_dir = Vector((0, 0, 1))
-            # 可能先击中竖直面（背板/侧板）或其他物体，需要跳过并继续向上检测
-            for _ in range(6):
-                res, loc, norm, _, obj, _ = scene.ray_cast(depsgraph, start_p, ray_dir)
-                if not res:
-                    break
-                hit_obj = obj.original if hasattr(obj, "original") else obj
-                if hit_obj != shelf_original:
-                    start_p = loc + Vector((0, 0, 0.002))
-                    continue
-                if abs(norm.z) < 0.8:
-                    start_p = loc + Vector((0, 0, 0.002))
-                    continue
-                dist = loc.z - center_pos.z
-                if dist > 0.03 and dist < min_headroom:
-                    min_headroom = dist
+        start_p = center_pos + Vector((0, 0, 0.02))
+        ray_dir = Vector((0, 0, 1))
+        for _ in range(3):  # 减少重试次数
+            res, loc, norm, _, obj, _ = scene.ray_cast(depsgraph, start_p, ray_dir)
+            if not res:
                 break
+            hit_obj = obj.original if hasattr(obj, "original") else obj
+            if hit_obj != shelf_original:
+                start_p = loc + Vector((0, 0, 0.002))
+                continue
+            if abs(norm.z) < 0.8:
+                start_p = loc + Vector((0, 0, 0.002))
+                continue
+            dist = loc.z - center_pos.z
+            if dist > 0.03 and dist < min_headroom:
+                min_headroom = dist
+            break
 
         if min_headroom > 900:
-            # 未命中上层水平面：可选择允许超出货架整体高度（地堆/下凹层板）
             if getattr(scene.sm_props_v34, "allow_overflow_stack", True):
                 min_headroom = 999.0
             else:
                 shelf_top_z = max([(shelf_obj.matrix_world @ Vector(c)).z for c in shelf_obj.bound_box])
                 min_headroom = max(0.0, shelf_top_z - center_pos.z)
+        
+        if headroom_cache is not None:
+            headroom_cache[cache_key] = min_headroom
         return min_headroom
 
     def check_floor_robust(self, scene, depsgraph, center_pos, radius, shelf_obj):
-        # 检查商品底部是否有有效的货架表面支撑
-        check_radius = min(radius * 0.5, 0.02)
-        offsets = [
-            Vector((0, 0, 0)),
-            Vector((check_radius, 0, 0)), Vector((-check_radius, 0, 0)),
-            Vector((0, check_radius, 0)), Vector((0, -check_radius, 0))
-        ]
+        # 简化版：只检测中心点（主射线已经验证过了）
         ray_start_lift = 0.05
         z_start = center_pos.z + ray_start_lift
         MAX_FLOAT_TOLERANCE = 0.01
         ray_length = ray_start_lift + MAX_FLOAT_TOLERANCE + 0.005
-        success_count = 0
         target_original = shelf_obj.original if hasattr(shelf_obj, "original") else shelf_obj
-        for off in offsets:
-            start_p = Vector((center_pos.x, center_pos.y, z_start)) + off
-            res, loc, norm, _, obj, _ = scene.ray_cast(
-                depsgraph, 
-                start_p, 
-                Vector((0, 0, -1)), 
-                distance=ray_length
-            )
-            if res:
-                hit_obj = obj.original if hasattr(obj, "original") else obj
-                if hit_obj != target_original:
-                    continue
-                if abs(norm.z) < 0.8: 
-                    continue
-                if not self.is_top_surface_at(scene, depsgraph, loc, shelf_obj):
-                    continue
-                diff = center_pos.z - loc.z 
-                MAX_EMBED_TOLERANCE = 0.03
-                if -MAX_EMBED_TOLERANCE <= diff <= MAX_FLOAT_TOLERANCE:
-                    success_count += 1
-        return success_count >= 3
+        
+        start_p = Vector((center_pos.x, center_pos.y, z_start))
+        res, loc, norm, _, obj, _ = scene.ray_cast(
+            depsgraph, start_p, Vector((0, 0, -1)), distance=ray_length
+        )
+        if not res:
+            return False
+        hit_obj = obj.original if hasattr(obj, "original") else obj
+        if hit_obj != target_original:
+            return False
+        if abs(norm.z) < 0.8:
+            return False
+        diff = center_pos.z - loc.z
+        return -0.03 <= diff <= MAX_FLOAT_TOLERANCE
 
     def is_top_surface_at(self, scene, depsgraph, hit_loc, shelf_obj, max_thickness=0.02):
         # 判定当前命中的货架面是否为层板上表面
@@ -524,8 +609,8 @@ class OT_GenerateShelfItems_v34(Operator):
         product_z_offsets = {p.name: self.get_z_offset(p) for p in all_products}
         product_footprints = {p.name: self.get_obj_footprint(p) for p in all_products}
         footprints = list(product_footprints.values())
-        grid_step = self.compute_grid_step(footprints, props)
-        if grid_step <= 0.0001: return {'CANCELLED'}
+        step_x_min, grid_step_y = self.compute_grid_step(footprints, props)
+        if grid_step_y <= 0.0001: return {'CANCELLED'}
         corners = [shelf.matrix_world @ Vector(c) for c in shelf.bound_box]
         max_z, min_z_bound = max([v.z for v in corners]), min([v.z for v in corners])
         local_dims = shelf.dimensions
@@ -552,57 +637,64 @@ class OT_GenerateShelfItems_v34(Operator):
         depth_margin = props.edge_margin_y if is_local_x_long else props.edge_margin_x
         usable_length = max(0.0, max_length - (length_margin * 2.0))
         usable_depth = max(0.0, max_depth - (depth_margin * 2.0))
-        cols = int(usable_length / grid_step)
-        rows = int(usable_depth / grid_step)
+        # cols 不再使用固定值
+        rows = int(usable_depth / grid_step_y)
         depth_direction = depth_axis if props.check_isolated else None
-        if COLLECTION_NAME not in bpy.data.collections:
-            stock_col = bpy.data.collections.new(COLLECTION_NAME)
+        if SKU_COLLECTION not in bpy.data.collections:
+            stock_col = bpy.data.collections.new(SKU_COLLECTION)
             context.scene.collection.children.link(stock_col)
         else:
-            stock_col = bpy.data.collections[COLLECTION_NAME]
+            stock_col = bpy.data.collections[SKU_COLLECTION]
         
         depsgraph = context.evaluated_depsgraph_get()
         plan_start, plan_end = -usable_length / 2.0, usable_length / 2.0
         ray_start_z = max_z + 1.0
-        total_count, placed_items, level_plans = 0, [], {}
+        total_count = 0
+        # SpatialGrid 使用较小的 step_x_min 保证精度
+        spatial_grid = SpatialGrid(cell_size=step_x_min) 
+        level_plans = {}
+        headroom_cache = {}  # 缓存层板高度信息
         
         # 追踪每个segment的位置信息（用于生成价签）
         segment_info = {}  # {seg_id: {'center': Vector, 'z_level': z, 'sku_name': name, 'count': n, 'min_proj': v, 'max_proj': v}}
         segment_counter = 0
         
-        # 生成所有格子坐标（使用货架局部轴，保证分组按长度轴生效）
-        grid_cells = []
-        length_start = -usable_length / 2.0 + (grid_step / 2.0)
-        depth_start = -usable_depth / 2.0 + (grid_step / 2.0)
+        # 改为逐行推进逻辑
+        length_start = -usable_length / 2.0
+        length_limit = usable_length / 2.0
+        depth_start = -usable_depth / 2.0 + (grid_step_y / 2.0)
+        
         for r_idx in range(rows):
-            for c_idx in range(cols):
+            # 每一行的Y坐标
+            row_y_local = depth_start + r_idx * grid_step_y
+            
+            # X轴光标初始化
+            current_x_local = length_start
+            
+            # 安全计数器防止死循环
+            col_safety = 1000
+            
+            while current_x_local < length_limit and col_safety > 0:
+                col_safety -= 1
+                
+                # 计算当前的世界坐标 (base_x, base_y) 用于射线检测
                 pos = (
                     shelf_center
-                    + length_axis * (length_start + c_idx * grid_step)
-                    + depth_axis * (depth_start + r_idx * grid_step)
+                    + length_axis * current_x_local
+                    + depth_axis * row_y_local
                 )
-                grid_cells.append((r_idx, c_idx, pos.x, pos.y))
-        
-        # 如果启用边缘优先，按距离中心由远到近排序
-        if props.prefer_edges:
-            center_x = shelf_center.x
-            center_y = shelf_center.y
-            grid_cells.sort(key=lambda cell: -((cell[2] - center_x)**2 + (cell[3] - center_y)**2)**0.5)
-        
-        # 遍历格子进行摆放
-        for r_idx, c_idx, base_x, base_y in grid_cells:
-                world_pos = Vector((base_x, base_y, 0))
-                rel_vec = world_pos - Vector((shelf_center.x, shelf_center.y, 0))
-                check_coord = rel_vec.dot(length_axis)
-                depth_local = rel_vec.dot(depth_axis)
-                depth_ratio = (depth_local + max_depth / 2.0) / max_depth if max_depth > 0.001 else 0.5
-                depth_ratio = max(0.0, min(1.0, depth_ratio))
-                if props.invert_front: 
-                    depth_ratio = 1.0 - depth_ratio
+                base_x, base_y = pos.x, pos.y
+                
+                # 这一步的步长，默认为最小步长 (精细扫描)
+                advance_step = step_x_min
+                
+                # 射线检测
                 cur_ray_z = ray_start_z
-                loop_safety = 50 
-                while loop_safety > 0:
-                    loop_safety -= 1
+                loop_safety_z = 50 
+                placed_in_this_column = False
+                
+                while loop_safety_z > 0:
+                    loop_safety_z -= 1
                     if cur_ray_z < min_z_bound: break
                     ray_orig = Vector((base_x, base_y, cur_ray_z))
                     success, loc, norm, idx, obj, mtx = scene.ray_cast(depsgraph, ray_orig, Vector((0,0,-1)))
@@ -610,62 +702,116 @@ class OT_GenerateShelfItems_v34(Operator):
                     next_ray_z = loc.z - 0.01 
                     if obj.name == shelf.name and abs(norm.z) > 0.8 and self.is_top_surface_at(scene, depsgraph, loc, shelf):
                         if props.check_isolated and depth_direction:
-                            neighbor_f = Vector((base_x, base_y, loc.z)) + depth_direction * grid_step
-                            neighbor_b = Vector((base_x, base_y, loc.z)) - depth_direction * grid_step
+                            # 使用 Y 方向步长检查相邻
+                            neighbor_f = Vector((base_x, base_y, loc.z)) + depth_direction * grid_step_y
+                            neighbor_b = Vector((base_x, base_y, loc.z)) - depth_direction * grid_step_y
                             has_neighbor = (self.is_valid_shelf_at(scene, depsgraph, neighbor_f, shelf, loc.z) or
                                             self.is_valid_shelf_at(scene, depsgraph, neighbor_b, shelf, loc.z))
                             if not has_neighbor:
                                 cur_ray_z = next_ray_z
                                 continue
+                        
+                        # 获取 Plan
                         level_key = round(loc.z / 0.05) * 0.05
                         if level_key not in level_plans:
                             lvl_rng = random.Random(actual_seed + int(level_key * 100))
-                            level_plans[level_key] = self.generate_global_plan(all_products, plan_start, plan_end, grid_step, props, lvl_rng)
+                            level_plans[level_key] = self.generate_global_plan(all_products, plan_start, plan_end, props, lvl_rng, product_footprints)
                         current_plan, current_stock = level_plans[level_key]
+                        
                         target, allow_placement, seg_idx = None, True, -1
+                        unit_width = step_x_min
+                        
                         if props.use_grouping and current_plan:
+                            # 在 Plan 中查找对应该 X 坐标的商品
+                            # 动态查找：current_x_local 在哪个段内
+                            # 考虑到 margin，我们给一点余量
+                            check_pos = current_x_local + 0.001
                             for i, seg in enumerate(current_plan):
-                                if check_coord <= seg['end'] + 0.001:
-                                    target, seg_idx = seg['obj'], i
+                                if check_pos >= seg['start'] and check_pos < seg['end']:
+                                    target = seg['obj']
+                                    seg_idx = i
+                                    unit_width = seg['unit_width']
                                     break
-                            if target is None:
-                                target, seg_idx = current_plan[-1]['obj'], len(current_plan)-1
-                            stock_val = current_stock[seg_idx]
-                            allow_placement = stock_val > 0.0 and depth_ratio <= stock_val + 0.001
+                            
+                            # 如果超出了所有段（理论上不应发生，除非精度问题），不做处理或取最后一个
+                            if target is None and check_pos >= current_plan[-1]['end']:
+                                # 已经超出了Plan范围，可能是末尾的空隙
+                                advance_step = step_x_min
+                                cur_ray_z = next_ray_z
+                                continue
+                                
+                            if target:
+                                half_w, _ = product_footprints[target.name]
+                                stock_val = current_stock[seg_idx]
+                                # 深度比率计算
+                                # 注意：现在X坐标并不是均匀的，但计算深度比例用Y坐标即可
+                                depth_local_val = row_y_local
+                                depth_ratio = (depth_local_val + max_depth / 2.0) / max_depth if max_depth > 0.001 else 0.5
+                                depth_ratio = max(0.0, min(1.0, depth_ratio))
+                                if props.invert_front: 
+                                    depth_ratio = 1.0 - depth_ratio
+                                allow_placement = stock_val > 0.0 and depth_ratio <= stock_val + 0.001
                         else:
-                            col_rng = random.Random(actual_seed + int(level_key * 1000) + int(check_coord * 100))
+                            # 不分组模式：随机
+                            # 也不再支持，为了视觉统一，强烈建议使用分组模式
+                            # 这里简单回退到随机选择
+                            col_rng = random.Random(actual_seed + int(level_key * 1000) + int(current_x_local * 100))
                             target = col_rng.choice(all_products)
-                            stock_val = 1.0 - props.vacancy_rate
-                            allow_placement = stock_val > 0.0 and depth_ratio <= stock_val + 0.001
+                            half_w, _ = product_footprints[target.name]
+                            unit_width = (half_w * 2.0) + props.gap
+                            base_stock = 1.0 - props.vacancy_rate
+                            allow_placement = True # 简化逻辑
+                        
+                        # 无论是否放置，推进步长固定为 step_x_min (依靠碰撞检测防止重叠)
+                        # 这样可以处理不同层不同宽度的商品
+                        # advance_step = step_x_min (已在循环外初始化)
+                        
                         if not target or not allow_placement:
                             cur_ray_z = next_ray_z
                             continue
+                            
+                        # [NEW] 边界检查：确保商品完全在货架内
+                        if current_x_local + unit_width > length_limit + 0.001:
+                            # 当前层当前位置放不下了，跳过
+                            cur_ray_z = next_ray_z
+                            continue
+                        
+                        # 放置逻辑...
                         target_radius_init = self.get_obj_radius(target, props.shape_mode)
-                        headroom = self.check_headroom_robust(scene, depsgraph, loc, target_radius_init, shelf)
+                        headroom = self.check_headroom_robust(scene, depsgraph, loc, target_radius_init, shelf, headroom_cache)
                         safe_limit = headroom * (1.0 - props.top_gap_ratio)
                         item_height = product_heights[target.name]
                         item_z_offset = product_z_offsets[target.name]
                         required_height = item_height + item_z_offset
                         if required_height > safe_limit:
-                            candidates = [p for p in all_products if (product_heights[p.name] + product_z_offsets[p.name]) <= safe_limit]
-                            if not candidates:
-                                cur_ray_z = next_ray_z
-                                continue
-                            sub_rng = random.Random(actual_seed + int(level_key * 500) + seg_idx)
-                            target = sub_rng.choice(candidates)
-                            item_height = product_heights[target.name]
-                            item_z_offset = product_z_offsets[target.name]
-                            required_height = item_height + item_z_offset
+                            cur_ray_z = next_ray_z
+                            continue
+                        
                         target_radius = self.get_obj_radius(target, props.shape_mode)
                         floor_ok = self.check_floor_robust(scene, depsgraph, loc, target_radius, shelf)
                         if not floor_ok:
                             cur_ray_z = next_ray_z
                             continue
+                            
+                        # 执行堆叠循环...
                         stack_count = 1
                         if props.use_stacking:
                             usable_height = max(0.0, safe_limit - item_z_offset)
                             stack_count = min(max(1, int(usable_height / item_height)), props.max_stack)
-                        local_rng = random.Random(actual_seed + r_idx * 100 + c_idx + int(level_key * 50))
+                        
+                        local_rng = random.Random(actual_seed + r_idx * 100 + int(current_x_local * 10) + int(level_key * 50))
+                        
+                        # 放置位置：当前扫描光标 + 纯物理半宽 (不含gap，让物体紧贴上一个物体的结束位置)
+                        # 间隙 (gap) 实际上是在下一个物体放置时体现的
+                        offset_to_center = half_w
+                        center_pos_world = (
+                            shelf_center
+                            + length_axis * (current_x_local + offset_to_center)
+                            + depth_axis * row_y_local
+                        )
+                        # 更新 loc 为实际放置中心
+                        loc = Vector((center_pos_world.x, center_pos_world.y, loc.z))
+                        
                         for k in range(stack_count):
                             base_loc = Vector((loc.x, loc.y, loc.z + (k * item_height)))
                             half_w, half_d = product_footprints[target.name]
@@ -677,12 +823,13 @@ class OT_GenerateShelfItems_v34(Operator):
                                 item_z_offset,
                                 half_w,
                                 half_d,
-                                placed_items,
+                                spatial_grid,
                                 props,
                                 local_rng,
                             )
                             if placed:
                                 total_count += 1
+                                placed_in_this_column = True
                                 # 更新segment位置信息
                                 if props.use_grouping and seg_idx >= 0:
                                     seg_key = f"{level_key}_{seg_idx}"
@@ -704,8 +851,13 @@ class OT_GenerateShelfItems_v34(Operator):
                                         segment_info[seg_key]['max_proj'] = proj
                             else:
                                 break
+                        
+                        # 如果在这一层放置成功了，就不用继续向下检测Z了（虽然逻辑上已经break了）
+                        # 但如果只是stock不够没放，也要推进X
                     cur_ray_z = next_ray_z
-        self.report({'INFO'}, f"生成完毕: {total_count} 个")
+                
+                # 推进 X 轴
+                current_x_local += advance_step
         
         # 生成价签
         if props.pricetag_enabled and segment_info:
