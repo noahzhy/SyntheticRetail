@@ -83,6 +83,11 @@ class SM_Properties_v34(PropertyGroup):
     ui_fold_spacing: BoolProperty(name="", default=True)
     ui_fold_edges: BoolProperty(name="", default=True)
     use_grouping: BoolProperty(name="启用分组", default=True)
+    sample_with_replacement: BoolProperty(
+        name="随机抽样: 有放回",
+        default=True,
+        description="勾选时每次抽取后放回；取消则无放回（候选逐个移除）"
+    )
     facing_min: IntProperty(name="排面Min", default=2, min=1)
     facing_max: IntProperty(name="排面Max", default=5, min=1)
     use_stacking: BoolProperty(name="允许垂直堆叠", default=False)
@@ -158,6 +163,12 @@ class OT_GenerateShelfItems_v34(Operator):
         bbox = [Vector(v) for v in obj.bound_box]
         min_z_local = min([v.z for v in bbox])
         return abs(min_z_local) * obj.scale.z
+    
+    def get_rotated_half_extents(self, half_w, half_d, rot_z):
+        # 计算绕Z轴旋转后的轴对齐半宽/半深，避免角点穿模
+        c = abs(math.cos(rot_z))
+        s = abs(math.sin(rot_z))
+        return (half_w * c + half_d * s), (half_w * s + half_d * c)
 
     def compute_grid_step(self, footprints, props):
         # 计算 Y 方向（深度）的统一网格步长，X 方向将动态计算
@@ -185,6 +196,8 @@ class OT_GenerateShelfItems_v34(Operator):
         half_w = target_half_w
         half_d = target_half_d
         EPSILON = 0.001
+        collision_margin = max(1.0, props.safety_margin)
+        gap_clearance = max(0.0, props.gap)
         
         # 尝试序列：几次全抖动 -> 几次半抖动 -> 无抖动
         scales = [1.0, 1.0, 0.5, 0.5, 0.0]
@@ -198,12 +211,14 @@ class OT_GenerateShelfItems_v34(Operator):
             else:
                 jx, jy, jr = 0.0, 0.0, 0.0
                 
+            rot_z = target.rotation_euler.z + jr
+            eff_half_w, eff_half_d = self.get_rotated_half_extents(half_w, half_d, rot_z)
             bottom_pos = Vector((base_loc.x + jx, base_loc.y + jy, base_loc.z))
             has_collision = False
             z_bottom_new = bottom_pos.z + EPSILON
             z_top_new = bottom_pos.z + item_height - EPSILON
             # 只检查附近的物体（空间索引加速）
-            nearby = spatial_grid.query_nearby(bottom_pos, half_w, half_d, item_height)
+            nearby = spatial_grid.query_nearby(bottom_pos, eff_half_w + gap_clearance, eff_half_d + gap_clearance, item_height)
             for pp, pw, pd, ph in nearby:
                 # pp 现在是 (x, y, z) tuple
                 pp_x, pp_y, pp_z = pp
@@ -217,8 +232,8 @@ class OT_GenerateShelfItems_v34(Operator):
                     dx = abs(pp_x - bottom_pos.x)
                     dy = abs(pp_y - bottom_pos.y)
                     # 碰撞判定：物理半径之和 + 极小容差(gap已经由外部控制位置了，这里只负责防穿模)
-                    limit_x = (half_w + pw) * 0.99 
-                    limit_y = (half_d + pd) * 0.99
+                    limit_x = (eff_half_w + pw) * collision_margin + gap_clearance
+                    limit_y = (eff_half_d + pd) * collision_margin + gap_clearance
                     if dx < limit_x and dy < limit_y:
                         has_collision = True
                         break
@@ -228,16 +243,24 @@ class OT_GenerateShelfItems_v34(Operator):
             new_o.data = target.data
             stock_col.objects.link(new_o)
             new_o.location = Vector((bottom_pos.x, bottom_pos.y, bottom_pos.z + item_z_offset))
-            new_o.rotation_euler.z = target.rotation_euler.z + jr
-            spatial_grid.insert(bottom_pos, half_w, half_d, item_height)
+            new_o.rotation_euler.z = rot_z
+            spatial_grid.insert(bottom_pos, eff_half_w, eff_half_d, item_height)
             return True
         return False
 
-    def generate_global_plan(self, products, plan_start, plan_end, props, rng, product_footprints):
+    def generate_global_plan(self, valid_products, plan_start, plan_end, props, rng, product_footprints, global_state=None):
         # 基于动态宽度的布局规划
-        if not products: return [], []
-        product_queue = products[:]
-        rng.shuffle(product_queue)
+        if not valid_products:
+            return [], []
+        # 使用“洗牌袋”策略：每次取出一个商品，候选里移除
+        # 有放回：袋子空时重新装满并洗牌；无放回：袋子空时结束
+        if global_state is not None:
+            product_queue = global_state["pool"]
+            queue_rng = global_state["rng"]
+        else:
+            product_queue = valid_products[:]
+            queue_rng = rng
+            queue_rng.shuffle(product_queue)
         shelf_plan = []
         segment_stock_levels = []
         current_p = plan_start
@@ -247,17 +270,30 @@ class OT_GenerateShelfItems_v34(Operator):
         
         while current_p < plan_end and loop_limit > 0:
             loop_limit -= 1
-            if not product_queue: 
-                product_queue = products[:]
-                rng.shuffle(product_queue)
+            if not product_queue:
+                if props.sample_with_replacement:
+                    if global_state is not None:
+                        product_queue[:] = valid_products[:]
+                        queue_rng.shuffle(product_queue)
+                    else:
+                        product_queue = valid_products[:]
+                        queue_rng.shuffle(product_queue)
+                else:
+                    break
+            if not product_queue:
+                break
             prod = product_queue.pop(0)
             
             # 获取该商品的实际占用宽度 (纯物理尺寸 + 间隙)
             half_w, _ = product_footprints[prod.name]
             # 这里 unit_width 表示该商品占据的空间槽位宽度
             unit_width = (half_w * 2.0) + props.gap
+            if not math.isfinite(unit_width) or unit_width <= 1e-6:
+                continue
             
-            facings = rng.randint(props.facing_min, props.facing_max)
+            f_min = min(props.facing_min, props.facing_max)
+            f_max = max(props.facing_min, props.facing_max)
+            facings = rng.randint(f_min, f_max)
             segment_len = facings * unit_width
             
             end_p = current_p + segment_len
@@ -608,7 +644,20 @@ class OT_GenerateShelfItems_v34(Operator):
         product_heights = {p.name: p.dimensions.z for p in all_products}
         product_z_offsets = {p.name: self.get_z_offset(p) for p in all_products}
         product_footprints = {p.name: self.get_obj_footprint(p) for p in all_products}
-        footprints = list(product_footprints.values())
+        # 过滤无效尺寸的商品，避免生成 0 宽度 segment 导致抽样/布局异常
+        valid_products = []
+        for p in all_products:
+            fp = product_footprints.get(p.name)
+            if not fp:
+                continue
+            half_w, _ = fp
+            if not math.isfinite(half_w) or half_w <= 1e-6:
+                continue
+            valid_products.append(p)
+        if not valid_products:
+            self.report({'ERROR'}, "没有有效尺寸的商品可用")
+            return {'CANCELLED'}
+        footprints = [product_footprints[p.name] for p in valid_products]
         step_x_min, grid_step_y = self.compute_grid_step(footprints, props)
         if grid_step_y <= 0.0001: return {'CANCELLED'}
         corners = [shelf.matrix_world @ Vector(c) for c in shelf.bound_box]
@@ -654,6 +703,13 @@ class OT_GenerateShelfItems_v34(Operator):
         spatial_grid = SpatialGrid(cell_size=step_x_min) 
         level_plans = {}
         headroom_cache = {}  # 缓存层板高度信息
+        # 全局去重用的“洗牌袋”
+        global_state = {
+            "all": valid_products,
+            "pool": valid_products[:],
+            "rng": random.Random(actual_seed + 99173),
+        }
+        global_state["rng"].shuffle(global_state["pool"])
         
         # 追踪每个segment的位置信息（用于生成价签）
         segment_info = {}  # {seg_id: {'center': Vector, 'z_level': z, 'sku_name': name, 'count': n, 'min_proj': v, 'max_proj': v}}
@@ -715,7 +771,7 @@ class OT_GenerateShelfItems_v34(Operator):
                         level_key = round(loc.z / 0.05) * 0.05
                         if level_key not in level_plans:
                             lvl_rng = random.Random(actual_seed + int(level_key * 100))
-                            level_plans[level_key] = self.generate_global_plan(all_products, plan_start, plan_end, props, lvl_rng, product_footprints)
+                            level_plans[level_key] = self.generate_global_plan(valid_products, plan_start, plan_end, props, lvl_rng, product_footprints, global_state)
                         current_plan, current_stock = level_plans[level_key]
                         
                         target, allow_placement, seg_idx = None, True, -1
@@ -756,7 +812,7 @@ class OT_GenerateShelfItems_v34(Operator):
                             # 也不再支持，为了视觉统一，强烈建议使用分组模式
                             # 这里简单回退到随机选择
                             col_rng = random.Random(actual_seed + int(level_key * 1000) + int(current_x_local * 100))
-                            target = col_rng.choice(all_products)
+                            target = col_rng.choice(valid_products)
                             half_w, _ = product_footprints[target.name]
                             unit_width = (half_w * 2.0) + props.gap
                             base_stock = 1.0 - props.vacancy_rate
@@ -925,6 +981,7 @@ class PT_ShelfMasterPanel_v34(Panel):
             box = layout.box()
             box.prop(props, "use_grouping")
             if props.use_grouping:
+                box.prop(props, "sample_with_replacement")
                 row = box.row(align=True)
                 row.prop(props, "facing_min")
                 row.prop(props, "facing_max")

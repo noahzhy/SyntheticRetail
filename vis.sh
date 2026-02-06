@@ -1,6 +1,8 @@
+export frame_idx=0017
+
 python3.12 utils/visual.py \
-    --labels /Users/haoyu/Documents/Projects/SyntheticRetail/labels/sequence_20260205_111854/frame_0001_20260205_111901.json \
-    --image /Users/haoyu/Documents/Projects/SyntheticRetail/labels/sequence_20260205_111854/frame_0001_20260205_111901.jpg \
+    --labels labels/sequence_20260206_162556/frame_${frame_idx}_20260206_162556.json \
+    --image labels/sequence_20260206_162556/frame_${frame_idx}_20260206_162556.jpg \
     --save preview.png \
     --no-show --hide-occluded
 
