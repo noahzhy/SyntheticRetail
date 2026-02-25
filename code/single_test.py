@@ -32,12 +32,13 @@ def segment_skus(skus, props, rng=None):
     """
     随机选择商品成组摆放
     
-    使用洗牌袋算法（shuffle bag）确保商品随机分布且不会过早重复。
-    每次从袋中随机抽取一个商品，抽完后重新洗牌。
-    
+    支持两种模式：
+    1. 重复抽取（替换采样）：商品用完后会重新补满，可无限抽取。
+    2. 不重复抽取（不替换采样）：商品抽完后即停止。
+
     Args:
         skus: 商品列表
-        props: 属性
+        props: 属性，包含 sample_with_replacement 选项
         rng: 随机数生成器（可选）
     
     Returns:
@@ -54,6 +55,11 @@ def segment_skus(skus, props, rng=None):
     shuffle_bag = skus[:]
     rng.shuffle(shuffle_bag)
     
+    # 如果是不替换采样，直接返回打乱后的列表
+    if not props.sample_with_replacement:
+        return [(sku, {}) for sku in shuffle_bag]
+
+    # 如果是替换采样，则生成一个更长的列表
     result = []
     # 生成足够多的商品组（假设最多需要100组）
     for _ in range(100):
@@ -74,6 +80,8 @@ def create_sku_instance(source_obj, target_collection):
     new_obj = source_obj.copy()
     if source_obj.data:
         new_obj.data = source_obj.data
+    new_obj.hide_render = False
+    new_obj.hide_viewport = False
     target_collection.objects.link(new_obj)
     return new_obj
 
@@ -294,6 +302,72 @@ def get_obj_depth(obj):
     return depth
 
 
+def is_cylinder(obj, vert_threshold=12, height_tolerance_ratio=0.01):
+    """
+    判断一个物体是否为圆柱体 (优化版)
+
+    通过快速分析其顶部和底部的顶点分布来判断。
+    1. 找出物体的最高和最低点 (Z轴)。
+    2. 识别出所有位于顶部和底部的顶点。
+    3. 检查是否存在一个完全由这些顶部或底部顶点组成的面。
+    4. 如果这个面的顶点数超过阈值，则认为是圆柱体。
+
+    这个方法比逐面计算法线更高效，尤其对于高精度模型。
+
+    Args:
+        obj: 要检查的物体
+        vert_threshold: 构成圆形顶/底面的最小顶点数。降低此值可放宽标准。
+        height_tolerance_ratio: 用于确定“顶部”/“底部”顶点的容差范围，基于物体总高度的比例。
+
+    Returns:
+        bool: 如果是圆柱体则为True，否则为False
+    """
+    if not obj or obj.type != 'MESH':
+        return False
+
+    mesh = obj.data
+    if not mesh.vertices or not mesh.polygons:
+        return False
+
+    # 1. 找出本地坐标中的最高和最低Z值
+    # 使用numpy可以更快，但为了避免依赖，使用常规Python
+    verts_co = [v.co for v in mesh.vertices]
+    if not verts_co:
+        return False
+        
+    min_z = min(v.z for v in verts_co)
+    max_z = max(v.z for v in verts_co)
+    
+    height = max_z - min_z
+    if height < 0.0001:
+        return False # A flat plane
+
+    # 2. 识别顶部和底部的顶点
+    # 使用一个小的容差来处理不完全平坦的表面
+    tolerance = height * height_tolerance_ratio
+    top_vert_indices = {i for i, v in enumerate(verts_co) if (max_z - v.z) < tolerance}
+    bottom_vert_indices = {i for i, v in enumerate(verts_co) if (v.z - min_z) < tolerance}
+
+    if not top_vert_indices and not bottom_vert_indices:
+        return False
+
+    # 3. 检查是否有由顶部或底部顶点组成的多边形
+    # 这比检查所有面的法线要快
+    for poly in mesh.polygons:
+        poly_verts = set(poly.vertices)
+        
+        # 检查是否为顶面或底面
+        is_top_face = poly_verts.issubset(top_vert_indices)
+        is_bottom_face = poly_verts.issubset(bottom_vert_indices)
+
+        if is_top_face or is_bottom_face:
+            # 4. 如果面的顶点数足够多，则认为是圆柱体
+            if len(poly.vertices) > vert_threshold:
+                return True
+
+    return False
+
+
 def compute_segment_width(sku, facing, spacing):
     """计算segment宽度"""
     return facing * get_obj_width(sku) + (facing - 1) * spacing
@@ -364,8 +438,7 @@ def place_object(obj, pos, rotation_z=0.0):
     obj.location.z = pos[2] + z_offset
     obj.rotation_euler.z = rotation_z
 
-
-def create_segment_label(text, position, depth_axis, level_z, props, target_collection):
+def create_segment_label(text, position, depth_axis, level_z, props, target_collection, seg_center_local, max_length):
     """
     创建segment标签（矩形价格签），垂直于层板外侧
     
@@ -376,6 +449,8 @@ def create_segment_label(text, position, depth_axis, level_z, props, target_coll
         level_z: 层板Z坐标
         props: 属性
         target_collection: 目标集合
+        seg_center_local: segment中心沿货架长度轴的局部坐标
+        max_length: 货架最大长度
     
     Returns:
         创建的标签对象
@@ -406,7 +481,35 @@ def create_segment_label(text, position, depth_axis, level_z, props, target_coll
     target_collection.objects.link(label_obj)
     
     # 计算标签位置（在层板前边缘外侧）
-    label_pos = Vector(position) + depth_axis * props.label_offset_depth
+    # 添加水平随机偏移
+    horizontal_offset_dist = 0.0
+    if props.label_random_horizontal_offset > 0.0:
+        horizontal_offset_dist = random.uniform(
+            -props.label_random_horizontal_offset, 
+            props.label_random_horizontal_offset
+        )
+        
+        # 限制偏移不超过货架左右边界
+        # 货架的局部 X 范围是 [-max_length/2, max_length/2]
+        # 标签的最终坐标将会是 seg_center_local + horizontal_offset_dist
+        tag_local_x = seg_center_local + horizontal_offset_dist
+        hw = width / 2.0
+        
+        # 考虑边缘边距(edge_margin) 和 标签自身半宽(hw)
+        min_allowed_x = -max_length / 2.0 + props.edge_margin + hw
+        max_allowed_x = max_length / 2.0 - props.edge_margin - hw
+        
+        # Clamp (约束)
+        if tag_local_x < min_allowed_x:
+            horizontal_offset_dist = min_allowed_x - seg_center_local
+        elif tag_local_x > max_allowed_x:
+            horizontal_offset_dist = max_allowed_x - seg_center_local
+    
+    # 根据 depth_axis (向前) 和 货架的UP(Z)，计算水平向右的方向 (length_axis_right)
+    # depth_axis cross Z = 右向向量
+    right_axis = Vector((depth_axis.y, -depth_axis.x, 0.0)).normalized() # 顺时针旋转90度得到右向向量
+    
+    label_pos = Vector(position) + depth_axis * props.label_offset_depth + right_axis * horizontal_offset_dist
     label_pos.z = level_z + props.label_offset_updown
     label_obj.location = label_pos
     
@@ -689,11 +792,16 @@ def generate_planogram(context, props):
         # 获取货架长度，使用局部坐标系统
         max_length = bounds.get('max_length', bounds['xmax'] - bounds['xmin'])
         
-        # 获取方向信息（用于标签）
+        # 获取方向信息（用于标签和商品旋转）
         length_axis = bounds.get('length_axis')
         depth_axis = bounds.get('depth_axis')
         center = bounds.get('center')
         max_depth = bounds.get('max_depth', 0)
+        
+        # 计算货架的Z轴旋转角度（根据深度轴方向 + 90度）
+        shelf_rotation_z = 0.0
+        if depth_axis is not None:
+            shelf_rotation_z = math.atan2(depth_axis.y, depth_axis.x) + math.radians(90)
         
         # 从货架中心开始的局部坐标光标
         x_cursor_local = -max_length / 2.0 + props.edge_margin
@@ -782,8 +890,13 @@ def generate_planogram(context, props):
                         stack_pos = (pos[0], pos[1], pos[2] + k * sku_height)
                         new_obj = create_sku_instance(sku, target_coll)
                         
-                        # 生成随机Z轴旋转角度（在±range范围内）
-                        rotation_z = random.uniform(-props.rotation_z_range, props.rotation_z_range)
+                        # 默认旋转等于货架旋转
+                        rotation_z = shelf_rotation_z
+                        
+                        # 如果是圆柱体，则应用随机旋转
+                        if is_cylinder(sku):
+                            random_rotation = random.uniform(-props.rotation_z_range, props.rotation_z_range)
+                            rotation_z += random_rotation
                         
                         place_object(new_obj, stack_pos, rotation_z)
                         level_placed += 1
@@ -801,7 +914,8 @@ def generate_planogram(context, props):
                 level_segments.append({
                     'sku_name': sku.name,
                     'center': seg_center_world,
-                    'depth_axis': depth_axis
+                    'depth_axis': depth_axis,
+                    'seg_center_local': seg_center_local
                 })
             
             # 更新光标位置（局部坐标）
@@ -816,7 +930,9 @@ def generate_planogram(context, props):
                     depth_axis=seg_info['depth_axis'],
                     level_z=bounds['z'],
                     props=props,
-                    target_collection=target_coll
+                    target_collection=target_coll,
+                    seg_center_local=seg_info['seg_center_local'],
+                    max_length=max_length
                 )
                 total_labels += 1
         
@@ -849,7 +965,8 @@ class PlanogramProperties(PropertyGroup):
         items=[('TOP_DOWN', "从上到下", ""), ('BOTTOM_UP', "从下到上", "")]
     )
     random_seed: IntProperty(name="随机种子", default=42)
-    allow_partial: BoolProperty(name="允许可部分填充", default=True)
+    allow_partial: BoolProperty(name="允许可部分填充（补满排面）", default=True)
+    sample_with_replacement: BoolProperty(name="重复抽取商品", default=True, description="允许在商品清单用完后重复抽取（替换采样）")
     use_stacking: BoolProperty(name="允许垂直堆叠", default=False)
     max_stack: IntProperty(name="最大堆叠数", default=3, min=1, max=10)
     top_gap_ratio: FloatProperty(name="顶部留空比例", default=0.05, min=0.0, max=0.5, description="上方预留空间占headroom的比例")
@@ -861,6 +978,7 @@ class PlanogramProperties(PropertyGroup):
     label_height: FloatProperty(name="标签高度", default=0.03, min=0.01, max=0.2, description="价格标签的高度")
     label_offset_depth: FloatProperty(name="标签前后偏移", default=0.0, min=0.0, max=0.5, description="标签距离层板前边缘的距离")
     label_offset_updown: FloatProperty(name="标签上下偏移", default=0.0, min=-0.5, max=0.5, description="标签距离层板前边缘的距离")
+    label_random_horizontal_offset: FloatProperty(name="标签水平随机偏移", default=0.0, min=0.0, max=0.5, description="标签在水平方向随机偏移的最大范围（±该值）")
 
     # UI折叠状态
     show_basic: BoolProperty(name="基础设置", default=True)
@@ -896,6 +1014,7 @@ class PLANOGRAM_PT_panel(Panel):
             box.prop(props, "random_seed")
             box.prop(props, "fill_order")
             box.prop(props, "allow_partial")
+            box.prop(props, "sample_with_replacement")
         
         # 布局参数（可折叠）
         box = layout.box()
@@ -946,6 +1065,7 @@ class PLANOGRAM_PT_panel(Panel):
                 col.prop(props, "label_height")
                 col.prop(props, "label_offset_depth")
                 col.prop(props, "label_offset_updown")
+                col.prop(props, "label_random_horizontal_offset")
         
         # 操作按钮
         layout.separator()
@@ -959,6 +1079,7 @@ class PLANOGRAM_PT_panel(Panel):
         if props.show_debug:
             box.operator("planogram_test.detect_levels", text="检测选中货架层板", icon='OUTLINER_OB_MESH')
             box.operator("planogram_test.detect_collection_levels", text="检测集合所有层板", icon='COLLECTION_COLOR_01')
+            box.operator("planogram_test.check_cylinder", text="检测是否为圆柱体", icon='MESH_CYLINDER')
 
 
 class PLANOGRAM_OT_clear(Operator):
@@ -1064,6 +1185,26 @@ class PLANOGRAM_OT_detect_collection_levels(Operator):
         return {'FINISHED'}
 
 
+class PLANOGRAM_OT_check_cylinder(Operator):
+    """检测选中物体是否为圆柱体"""
+    bl_idname = "planogram_test.check_cylinder"
+    bl_label = "Check if Cylinder"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj:
+            self.report({'ERROR'}, "请先选择一个物体")
+            return {'CANCELLED'}
+
+        if is_cylinder(obj):
+            self.report({'INFO'}, f"物体 '{obj.name}' 是一个圆柱体。")
+        else:
+            self.report({'INFO'}, f"物体 '{obj.name}' 不是一个圆柱体。")
+        
+        return {'FINISHED'}
+
+
 # ============================================================================
 # 注册
 # ============================================================================
@@ -1075,6 +1216,7 @@ classes = [
     PLANOGRAM_OT_layout,
     PLANOGRAM_OT_detect_levels,
     PLANOGRAM_OT_detect_collection_levels,
+    PLANOGRAM_OT_check_cylinder,
 ]
 
 
