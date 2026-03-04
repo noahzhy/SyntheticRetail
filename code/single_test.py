@@ -842,7 +842,20 @@ def generate_planogram(context, props):
             
             for i in range(facing):
                 for d in range(depth):
-                    pos = compute_position(x_cursor_local, bounds, sku, i, d, props)
+                    pos_raw = compute_position(x_cursor_local, bounds, sku, i, d, props)
+                    
+                    # 添加随机位置偏移
+                    if props.position_noise > 0.0:
+                        offset_x = random.uniform(-props.position_noise, props.position_noise)
+                        offset_y = random.uniform(-props.position_noise, props.position_noise)
+                        
+                        if length_axis is not None and depth_axis is not None:
+                            offset_vec = length_axis * offset_x + depth_axis * offset_y
+                            pos = (pos_raw[0] + offset_vec.x, pos_raw[1] + offset_vec.y, pos_raw[2])
+                        else:
+                            pos = (pos_raw[0] + offset_x, pos_raw[1] + offset_y, pos_raw[2])
+                    else:
+                        pos = pos_raw
                     
                     # 边界检查
                     if pos[0] - sku_width/2 < bounds['xmin'] + props.edge_margin:
@@ -971,6 +984,7 @@ class PlanogramProperties(PropertyGroup):
     max_stack: IntProperty(name="最大堆叠数", default=3, min=1, max=10)
     top_gap_ratio: FloatProperty(name="顶部留空比例", default=0.05, min=0.0, max=0.5, description="上方预留空间占headroom的比例")
     rotation_z_range: FloatProperty(name="Z轴旋转范围", default=180.0, min=0.0, max=180.0, subtype='ANGLE', description="商品Z轴随机旋转的最大角度（实际旋转范围为±此值）")
+    position_noise: FloatProperty(name="位置随机轻微偏移", default=0.0, min=0.0, max=0.1, description="商品位置水平产生的随机轻微偏移范围（最大距离）")
     
     # 标签设置
     use_labels: BoolProperty(name="生成标签", default=False, description="为每个segment生成价格标签")
@@ -984,9 +998,12 @@ class PlanogramProperties(PropertyGroup):
     show_basic: BoolProperty(name="基础设置", default=True)
     show_layout: BoolProperty(name="布局参数", default=False)
     show_stacking: BoolProperty(name="堆叠设置", default=False)
-    show_rotation: BoolProperty(name="旋转设置", default=False)
+    show_rotation: BoolProperty(name="随机变换设置", default=False)
     show_labels: BoolProperty(name="标签设置", default=False)
     show_debug: BoolProperty(name="调试工具", default=False)
+    
+    # 清理设置
+    auto_clean_unused: BoolProperty(name="清空后自动清理未使用数据", default=True, description="执行清空操作后，自动清理场景中未使用的冗余数据块(如材质、网格等)")
 
 
 class PLANOGRAM_PT_panel(Panel):
@@ -1046,12 +1063,13 @@ class PLANOGRAM_PT_panel(Panel):
                 col.prop(props, "max_stack")
                 col.prop(props, "top_gap_ratio")
         
-        # 旋转设置（可折叠）
+        # 随机变换设置（可折叠）
         box = layout.box()
         row = box.row()
         row.prop(props, "show_rotation", icon='TRIA_DOWN' if props.show_rotation else 'TRIA_RIGHT', emboss=False)
         if props.show_rotation:
             box.prop(props, "rotation_z_range")
+            box.prop(props, "position_noise")
         
         # 标签设置（可折叠）
         box = layout.box()
@@ -1070,7 +1088,11 @@ class PLANOGRAM_PT_panel(Panel):
         # 操作按钮
         layout.separator()
         layout.operator("planogram_test.layout", text="生成陈列布局", icon='PLAY')
-        layout.operator("planogram_test.clear", text="清空陈列布局", icon='TRASH')
+        
+        row = layout.row(align=True)
+        row.operator("planogram_test.clear", text="清空陈列布局", icon='TRASH')
+        row.prop(props, "auto_clean_unused", text="", icon='BRUSH_DATA')
+        
         
         # 调试工具（可折叠）
         box = layout.box()
@@ -1097,8 +1119,23 @@ class PLANOGRAM_OT_clear(Operator):
         
         if collections_to_remove:
             bpy.data.batch_remove(collections_to_remove)
+            
+        props = context.scene.planogram_props_test
+        clean_msg = ""
         
-        self.report({'INFO'}, f"已清空 {len(collections_to_remove)} 个集合")
+        if props.auto_clean_unused:
+            # 多次执行orphans_purge直到没有多余孤立数据
+            purge_count = 0
+            while True:
+                result = bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+                # orphans_purge 实际上没有好的返回值告诉你清理了多少，但在API中它会在不再有东西可清理时停止
+                # 为了安全且有效，我们循环3次通常就足以清除级联的孤立数据(比如先删除对象，后删除网格，再材质)
+                purge_count += 1
+                if purge_count >= 3:
+                    break
+            clean_msg = " 并已清理未使用数据块"
+        
+        self.report({'INFO'}, f"已清空 {len(collections_to_remove)} 个集合{clean_msg}")
         return {'FINISHED'}
 
 
