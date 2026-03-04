@@ -207,8 +207,11 @@ def detect_shelf_front(shelf_obj, context, depth_axis, center, max_depth):
     """
     自动检测货架的前方（开口方向）
     
-    通过向深度轴两个方向发射射线，检测哪一侧有更多开放空间。
-    如果检测到深度轴方向错误（指向背板），则翻转方向。
+    通过向深度轴两个方向发射【水平】射线，检测哪一侧更早碰到垂直面（背板）。
+    背板命中距离更短的方向 = 背板方向，翻转后使depth_axis指向开口前方。
+    
+    原先使用垂直向下射线，层板水平面在正负两侧均会命中，导致判断失效。
+    改用水平射线后，背板（垂直面，法线水平）和开口（无命中/远距）有明显区别。
     
     Args:
         shelf_obj: 货架对象
@@ -224,24 +227,42 @@ def detect_shelf_front(shelf_obj, context, depth_axis, center, max_depth):
     depsgraph = context.evaluated_depsgraph_get()
     shelf_original = shelf_obj.original if hasattr(shelf_obj, "original") else shelf_obj
     
-    def test_direction(offset):
-        """测试指定方向是否击中货架"""
-        test_point = center + offset
+    # 在货架高度范围内多个高度采样，提高鲁棒性
+    corners = [shelf_obj.matrix_world @ Vector(c) for c in shelf_obj.bound_box]
+    z_min = min(v.z for v in corners)
+    z_max = max(v.z for v in corners)
+    sample_heights = [z_min + (z_max - z_min) * t for t in (0.3, 0.5, 0.7)]
+    
+    max_ray_dist = max_depth * 1.5
+    
+    def hit_dist_horizontal(direction, z):
+        """从中心以给定水平方向发射射线，返回命中垂直面的距离（未命中返回999）"""
+        origin = Vector((center.x, center.y, z))
         res, loc, norm, _, obj, _ = scene.ray_cast(
-            depsgraph, test_point + Vector((0, 0, 0.5)), Vector((0, 0, -1))
+            depsgraph, origin, direction, distance=max_ray_dist
         )
-        if res:
-            hit_obj = obj.original if hasattr(obj, "original") else obj
-            return hit_obj == shelf_original and abs(norm.z) > 0.8
-        return False
+        if not res:
+            return 999.0
+        hit_obj = obj.original if hasattr(obj, "original") else obj
+        if hit_obj != shelf_original:
+            return 999.0
+        # 判断命中面是否为垂直面（背板法线接近水平，abs(norm.z) < 0.5）
+        if abs(norm.z) < 0.5:
+            return (Vector(loc) - origin).length
+        return 999.0
     
-    # 测试深度轴两个方向
-    test_distance = max_depth * 0.4
-    pos_hit = test_direction(depth_axis * test_distance)
-    neg_hit = test_direction(-depth_axis * test_distance)
+    # 统计各高度层在正/负方向命中背板的距离
+    pos_dists = [hit_dist_horizontal(depth_axis, z) for z in sample_heights]
+    neg_dists = [hit_dist_horizontal(-depth_axis, z) for z in sample_heights]
     
-    # 如果负方向击中（背板），正方向开放（前方），则翻转
-    if neg_hit and not pos_hit:
+    # 取中位距离进行比较，距离更小的方向 = 背板方向
+    pos_dists.sort()
+    neg_dists.sort()
+    pos_median = pos_dists[len(pos_dists) // 2]
+    neg_median = neg_dists[len(neg_dists) // 2]
+    
+    # 正方向更近 = 正方向是背板 → 翻转，使depth_axis指向前方（开口）
+    if pos_median < neg_median:
         return -depth_axis
     
     return depth_axis
@@ -541,11 +562,12 @@ def create_segment_label(text, position, depth_axis, level_z, props, target_coll
     return label_obj
 
 
-def is_top_surface(scene, depsgraph, hit_loc, shelf_obj, max_thickness=0.02):
+def is_top_surface(scene, depsgraph, hit_loc, shelf_obj, max_thickness=0.06):
     """
     判断命中点是否为层板上表面（而非底面）
     
-    通过从命中点向上发射短距离射线，检查是否有同一货架的遮挡
+    通过从命中点向上发射短距离射线，检查是否有同一货架的遮挡。
+    max_thickness 设为 0.06m，可处理最厚约 6cm 的层板。
     """
     shelf_original = shelf_obj.original if hasattr(shelf_obj, "original") else shelf_obj
     start_p = hit_loc + Vector((0, 0, 0.002))
@@ -681,20 +703,27 @@ def detect_shelf_levels_by_ray(shelf_obj, context, sample_density=5):
                 
                 if hit_obj == shelf_original and abs(norm.z) > 0.8:
                     if is_top_surface(scene, depsgraph, loc, shelf_obj):
-                        z_key = round(loc.z / 0.03) * 0.03
+                        # 用 0.05m 精度分组，避免同一层板因浮点误差被拆成多层
+                        z_key = round(loc.z / 0.05) * 0.05
                         if z_key not in levels:
                             levels[z_key] = {
                                 'z': loc.z,
                                 'hit_count': 0
                             }
                         levels[z_key]['hit_count'] += 1
+                        # 命中上表面后，跳过整块层板厚度再继续向下
+                        cur_z = loc.z - 0.10
+                        continue
                 
+                # 未命中层板上表面时，小步下移继续搜索
                 cur_z = loc.z - 0.02
     
     # 转换为结果列表，使用包围盒边界而不是采样点范围
+    # 最少命中次数阈值：要求至少 3 条射线命中，过滤侧板/背板等噪声
+    min_hit_count = max(3, int(sample_density * sample_density * 0.15))
     result = []
     for z_key, data in levels.items():
-        if data['hit_count'] > 0:
+        if data['hit_count'] >= min_hit_count:
             result.append({
                 'z': data['z'],
                 'xmin': bbox_min_x,
@@ -731,6 +760,28 @@ def generate_planogram(context, props):
         report_error("Invalid collection selection")
         return
     
+    # ----------------------------------------------------------------
+    # scene.ray_cast() 不会命中视口隐藏的物体。
+    # 在整个生成过程（层板检测 + 商品摆放）中临时强制显示所有货架对象，
+    # 函数结束后统一还原，确保两个阶段的射线检测都能正常工作。
+    # ----------------------------------------------------------------
+    shelves_all = [obj for obj in shelf_coll.objects if obj.type == 'MESH']
+    visibility_backup = {}  # obj -> (hide_viewport, hide_get)
+    coll_hide_backup = shelf_coll.hide_viewport
+    shelf_coll.hide_viewport = False
+    for _s in shelves_all:
+        visibility_backup[_s] = (_s.hide_viewport, _s.hide_get())
+        _s.hide_viewport = False
+        _s.hide_set(False)
+    context.view_layer.update()
+    
+    def _restore_visibility():
+        shelf_coll.hide_viewport = coll_hide_backup
+        for _s, (_hv, _hg) in visibility_backup.items():
+            _s.hide_viewport = _hv
+            _s.hide_set(_hg)
+        context.view_layer.update()
+    
     # 清理已存在的SM_开头的集合
     sm_collections = [coll for coll in bpy.data.collections if coll.name.startswith("SM_")]
     if sm_collections:
@@ -765,6 +816,7 @@ def generate_planogram(context, props):
     
     if not shelf_levels:
         report_error("未检测到任何可用层板")
+        _restore_visibility()
         return
     
     # 获取SKU列表
@@ -773,6 +825,7 @@ def generate_planogram(context, props):
     
     if not skus:
         report_error("商品集合中没有可用商品")
+        _restore_visibility()
         return
     
     # 按填充顺序处理每层
@@ -952,7 +1005,9 @@ def generate_planogram(context, props):
         print(f"层板 {level_idx + 1} (Z={bounds['z']:.3f}m): 放置了 {level_placed} 个商品, {len(level_segments)} 个标签")
     
     print(f"\n总计放置了 {total_placed} 个商品, {total_labels} 个标签")
-
+    
+    # 还原货架可见性
+    _restore_visibility()
 
 
 # ============================================================================
